@@ -3,7 +3,7 @@
  * Plugin Name: Cloudways Cache Purge
  * Plugin URI: https://github.com/4ddcommunication/cloudways-cache-purge
  * Description: Leert Breeze + Cloudways Server-Cache (Varnish) per Knopfdruck und wärmt danach die wichtigsten Seiten vor. Purged zusätzlich automatisch einzelne URLs bei Produkt-/Seiten-Änderungen (z.B. Preis/Bestand aus JTL-Wawi) und frischt nachts per WP-CLI den kompletten deutschen Bestand auf.
- * Version: 1.3.0
+ * Version: 1.3.1
  * Author: 4DD Communication GmbH
  * Author URI: https://4dd.de
  * License: GPL v2 or later
@@ -72,6 +72,7 @@ class Cloudways_Cache_Purge {
             add_action('woocommerce_product_set_stock', [$this, 'queue_product_object'], 10, 1);
             add_action('woocommerce_variation_set_stock', [$this, 'queue_product_object'], 10, 1);
             add_action('save_post', [$this, 'queue_saved_post'], 10, 2);
+            add_action('set_object_terms', [$this, 'queue_term_change'], 10, 6);
             add_action('shutdown', [$this, 'flush_purge_queue'], 999);
         }
 
@@ -155,6 +156,39 @@ class Cloudways_Cache_Purge {
             return;
         }
         $this->purge_queue[(int) $post_id] = true;
+    }
+
+    /**
+     * JTL legt Produkte teils zweistufig an: erst der Post, dann die Kategorien
+     * per wp_set_object_terms() — u.U. in einem SPAETEREN Connector-Request.
+     * Dort feuert weder save_post noch ein Meta-Hook. Ohne diesen Hook wuerde
+     * urls_for_product() beim Anlegen keine Regel treffen (Produkt hat noch
+     * keine Terme) und eine nachtraegliche Kategorie-Aenderung bliebe bis zum
+     * Sammellauf unsichtbar.
+     *
+     * Nur product_cat + pwb-brand: exakt die Taxonomien, auf die Purge-Regeln
+     * und Uebersichtsseiten matchen. set_object_terms feuert bei JEDEM
+     * Term-Write jeder Taxonomie (auch page_category, Attribute etc.).
+     */
+    public function queue_term_change($object_id, $terms, $tt_ids, $taxonomy, $append, $old_tt_ids) {
+        if ($taxonomy !== 'product_cat' && $taxonomy !== 'pwb-brand') {
+            return;
+        }
+        // JTL schreibt Terme bei jedem Sync neu, meist identisch — dann ist
+        // nichts veraltet und ein Purge wuerde die Seiten nur unnoetig kalt machen.
+        if (!$append) {
+            $new = array_map('intval', (array) $tt_ids);
+            $old = array_map('intval', (array) $old_tt_ids);
+            sort($new);
+            sort($old);
+            if ($new === $old) {
+                return;
+            }
+        }
+        if (get_post_type($object_id) !== 'product') {
+            return;
+        }
+        $this->purge_queue[(int) $object_id] = true;
     }
 
     /**
