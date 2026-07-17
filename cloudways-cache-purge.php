@@ -220,9 +220,35 @@ class Cloudways_Cache_Purge {
             foreach (array_keys($rule_urls) as $url) {
                 $this->purge_url($url);
             }
+
             if ($rule_urls) {
-                // Sofort wieder warm machen, damit kein Kunde in den kalten Render laeuft.
-                $this->fetch_parallel(array_keys($rule_urls));
+                // ⚠ Dieser Code laeuft im shutdown-Hook — also INNERHALB des
+                // JTL-Connector-Requests. Purgen ist billig (URLPURGE = Ban, ~10 ms),
+                // Rewarming aber NICHT: ~7 s pro Seite, und ein Bohnen-Produkt trifft
+                // 15 Seiten. Gemessen 17.07.: 34 s fuer 18 URLs. Wuerde die Wawi so
+                // lange blockiert, drohen Connector-Timeouts.
+                //
+                // fastcgi_finish_request() sendet die Antwort und schliesst die
+                // Verbindung — PHP arbeitet danach weiter. Nur WENN das geht (oder
+                // wir ohnehin in der CLI sind), waermen wir hier. Sonst uebernimmt
+                // der Sammellauf-Cron. Damit kann dieser Hook den Connector
+                // konstruktiv nicht ausbremsen, egal wie die PHP-SAPI konfiguriert ist.
+                $can_block = php_sapi_name() === 'cli' || function_exists('fastcgi_finish_request');
+
+                if ($can_block) {
+                    if (function_exists('fastcgi_finish_request')) {
+                        fastcgi_finish_request();
+                    }
+                    // In Bloecken statt alles auf einmal: sonst startet ein grosser
+                    // JTL-Sync dutzende Renders parallel und bremst den Server —
+                    // genau die 7-s-Seiten, die wir vermeiden wollen.
+                    $chunk = max(1, (int) apply_filters('cw_cache_rewarm_concurrency', 4));
+                    foreach (array_chunk(array_keys($rule_urls), $chunk) as $batch) {
+                        $this->fetch_parallel($batch);
+                    }
+                } else {
+                    $needs_bulk = true; // gepurged ist schon; Waermen macht der Cron
+                }
             }
 
             if ($needs_bulk) {
