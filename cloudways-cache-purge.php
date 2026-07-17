@@ -66,6 +66,7 @@ class Cloudways_Cache_Purge {
 
         if (defined('WP_CLI') && WP_CLI) {
             \WP_CLI::add_command('cw-cache refresh', [$this, 'cli_refresh']);
+            \WP_CLI::add_command('cw-cache refresh-listings', [$this, 'cli_refresh_listings']);
             \WP_CLI::add_command('cw-cache purge-url', [$this, 'cli_purge_url']);
         }
     }
@@ -156,7 +157,11 @@ class Cloudways_Cache_Purge {
         }
 
         $urls = [];
+        $product_changed = false;
         foreach ($ids as $id) {
+            if (get_post_type($id) === 'product') {
+                $product_changed = true;
+            }
             $link = get_permalink($id);
             if (!$link) {
                 continue;
@@ -164,6 +169,16 @@ class Cloudways_Cache_Purge {
             foreach ($this->url_variants($link) as $variant) {
                 $urls[$variant] = true;
             }
+        }
+
+        // Uebersichtsseiten (/espressomaschine/alle-maschinen/ etc.) zeigen Preis
+        // UND Lagerstatus, liegen aber unter eigenen URLs — der Produkt-Purge oben
+        // erwischt sie nicht. Sie hier direkt mitzupurgen waere fatal: JTL aendert
+        // 45-131 Produkte/Werktag, die Uebersichten waeren dauernd kalt (~7 s/Seite).
+        // Deshalb nur markieren; `wp cw-cache refresh-listings` (Cron alle 15 Min)
+        // purged + waermt sie gebuendelt und nur wenn sich wirklich etwas geaendert hat.
+        if ($product_changed) {
+            update_option('cw_listings_dirty', time(), false);
         }
 
         $done = 0;
@@ -589,6 +604,60 @@ class Cloudways_Cache_Purge {
         }
         $this->purge_url($args[0]);
         \WP_CLI::success('Gepurged: ' . $args[0]);
+    }
+
+    /**
+     * `wp cw-cache refresh-listings` — frischt die Uebersichtsseiten auf, aber nur
+     * wenn seit dem letzten Lauf ein Produkt geaendert wurde.
+     *
+     * Hintergrund: Uebersichtsseiten wie /espressomaschine/alle-maschinen/ zeigen
+     * „Auf Lager"/„Ausverkauft" und Preise, haben aber eigene URLs — der Auto-Purge
+     * des Produkts erwischt sie nicht. Ohne das stand ein wieder lieferbares Produkt
+     * dort bis zum Nacht-Refresh auf „Ausverkauft" = verlorene Verkaeufe.
+     *
+     * Gedrosselt statt sofort, weil JTL 45-131 Produkte pro Werktag aendert: bei
+     * Sofort-Purge waeren die Uebersichten dauerhaft kalt.
+     *
+     * ## OPTIONS
+     * [--force]            : Auch laufen, wenn nichts als geaendert markiert ist.
+     * [--concurrency=<n>]  : Parallele Requests (Default 6).
+     */
+    public function cli_refresh_listings($args, $assoc = []) {
+        $dirty = get_option('cw_listings_dirty', 0);
+        if (!$dirty && !isset($assoc['force'])) {
+            \WP_CLI::log('Nichts geaendert — nichts zu tun.');
+            return;
+        }
+
+        $concurrency = max(1, (int) ($assoc['concurrency'] ?? 6));
+        $urls = $this->collect_prewarm_urls();
+        if (empty($urls)) {
+            \WP_CLI::warning('Keine Uebersichts-URLs gefunden (Menue-Einstellung pruefen).');
+            return;
+        }
+
+        // Flag VOR der Arbeit loeschen: Aenderungen waehrend des Laufs sollen
+        // den naechsten Lauf ausloesen, nicht verschluckt werden.
+        delete_option('cw_listings_dirty');
+
+        $started = microtime(true);
+        $ok = 0;
+        foreach (array_chunk($urls, $concurrency) as $chunk) {
+            foreach ($chunk as $url) {
+                $this->purge_url($url);
+            }
+            $ok += $this->fetch_parallel($chunk);
+        }
+
+        $duration = round(microtime(true) - $started, 1);
+        update_option('cw_last_listings_refresh', [
+            'time'     => current_time('mysql'),
+            'urls'     => count($urls),
+            'ok'       => $ok,
+            'duration' => $duration,
+        ], false);
+
+        \WP_CLI::success(sprintf('%d/%d Uebersichtsseiten aufgefrischt in %s s.', $ok, count($urls), $duration));
     }
 
     /**
