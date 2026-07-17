@@ -67,6 +67,7 @@ class Cloudways_Cache_Purge {
         if (defined('WP_CLI') && WP_CLI) {
             \WP_CLI::add_command('cw-cache refresh', [$this, 'cli_refresh']);
             \WP_CLI::add_command('cw-cache refresh-listings', [$this, 'cli_refresh_listings']);
+            \WP_CLI::add_command('cw-cache suggest-rules', [$this, 'cli_suggest_rules']);
             \WP_CLI::add_command('cw-cache purge-url', [$this, 'cli_purge_url']);
         }
     }
@@ -171,14 +172,54 @@ class Cloudways_Cache_Purge {
             }
         }
 
-        // Uebersichtsseiten (/espressomaschine/alle-maschinen/ etc.) zeigen Preis
-        // UND Lagerstatus, liegen aber unter eigenen URLs — der Produkt-Purge oben
-        // erwischt sie nicht. Sie hier direkt mitzupurgen waere fatal: JTL aendert
-        // 45-131 Produkte/Werktag, die Uebersichten waeren dauernd kalt (~7 s/Seite).
-        // Deshalb nur markieren; `wp cw-cache refresh-listings` (Cron alle 15 Min)
-        // purged + waermt sie gebuendelt und nur wenn sich wirklich etwas geaendert hat.
+        // Uebersichtsseiten (/espressomaschine/alle-maschinen/ etc.) zeigen Preis UND
+        // Lagerstatus, liegen aber unter eigenen URLs — der Produkt-Purge oben erwischt
+        // sie nicht. Zwei Wege, absichtlich kombiniert:
+        //
+        // 1. Purge-Regeln (Einstellungen): „marke:ecm => /espressomaschine/ecm/, ..."
+        //    Greift eine Regel, werden GENAU diese Seiten sofort gepurged. Praezise
+        //    und billig — statt 105 Seiten nur die betroffenen.
+        // 2. Sicherheitsnetz: Greift fuer ein geaendertes Produkt KEINE Regel, wird
+        //    der Sammellauf markiert (Cron alle 15 Min, alle 105 Menue-URLs). So ist
+        //    nichts ungeschuetzt, solange die Regeln noch unvollstaendig sind.
+        //
+        // Direkt-Purge aller Uebersichten bei jeder Aenderung waere keine Option:
+        // JTL aendert 45-131 Produkte/Werktag, die Seiten waeren dauernd kalt (~7 s).
         if ($product_changed) {
-            update_option('cw_listings_dirty', time(), false);
+            $rule_urls   = [];
+            $needs_bulk  = false;
+
+            foreach ($ids as $id) {
+                if (get_post_type($id) !== 'product') {
+                    continue;
+                }
+                $matched = $this->urls_for_product($id);
+                if ($matched === null) {
+                    $needs_bulk = true; // keine Regel -> Sammellauf muss ran
+                    continue;
+                }
+                foreach ($matched as $u) {
+                    $rule_urls[$u] = true;
+                }
+            }
+
+            foreach (array_keys($rule_urls) as $url) {
+                $this->purge_url($url);
+            }
+            if ($rule_urls) {
+                // Sofort wieder warm machen, damit kein Kunde in den kalten Render laeuft.
+                $this->fetch_parallel(array_keys($rule_urls));
+            }
+
+            if ($needs_bulk) {
+                update_option('cw_listings_dirty', time(), false);
+            }
+
+            update_option('cw_last_rule_purge', [
+                'time'       => current_time('mysql'),
+                'rule_urls'  => count($rule_urls),
+                'bulk_noetig' => $needs_bulk,
+            ], false);
         }
 
         $done = 0;
@@ -194,6 +235,104 @@ class Cloudways_Cache_Purge {
             'urls'    => $done,
             'capped'  => $capped,
         ], false);
+    }
+
+    /**
+     * Purge-Regeln aus den Einstellungen parsen.
+     *
+     * Syntax, eine Regel pro Zeile:
+     *   marke:ecm => /espressomaschine/alle-maschinen/, /espressomaschine/ecm/
+     *   kategorie:espressomaschinen => /espressomaschine/alle-maschinen/
+     *
+     * Bewusst manuell gepflegt statt automatisch aus dem Seiteninhalt geparst:
+     * Die Uebersichtsseiten listen Produkte auf drei verschiedene Arten
+     * ([ep_products], [ep_filtered_products], Uncode-loop mit tax_query) — teils
+     * base64+urlencoded in [vc_raw_html] versteckt. Ein Parser dafuer haette einen
+     * STILLEN Fehlermodus: uebersieht er eine Seite, zeigt sie unbemerkt falsche
+     * Bestaende. Eine gepflegte Regel kann ein Mensch dagegen korrigieren.
+     *
+     * @return array Liste von ['type' => 'brand'|'cat', 'slug' => string, 'urls' => string[]]
+     */
+    private function parse_purge_rules() {
+        $settings = get_option($this->option_name, []);
+        $raw      = $settings['purge_rules'] ?? '';
+        $rules    = [];
+
+        foreach ($this->parse_url_lines($raw) as $line) {
+            if (strpos($line, '=>') === false) {
+                continue;
+            }
+            list($trigger, $targets) = array_map('trim', explode('=>', $line, 2));
+
+            if (!preg_match('/^(marke|brand|kategorie|kategorie|cat|category)\s*:\s*(.+)$/i', $trigger, $m)) {
+                continue;
+            }
+            $type = in_array(strtolower($m[1]), ['marke', 'brand'], true) ? 'brand' : 'cat';
+            $slug = sanitize_title(trim($m[2]));
+
+            $urls = [];
+            foreach (explode(',', $targets) as $u) {
+                $u = trim($u);
+                if ($u === '') {
+                    continue;
+                }
+                // Relative Pfade auf die Domain heben.
+                if (strpos($u, 'http') !== 0) {
+                    $u = home_url('/' . ltrim($u, '/'));
+                }
+                $urls[] = $u;
+            }
+            if ($slug !== '' && $urls) {
+                $rules[] = ['type' => $type, 'slug' => $slug, 'urls' => $urls];
+            }
+        }
+
+        return $rules;
+    }
+
+    /**
+     * URLs, die wegen dieses Produkts mitgepurged werden muessen.
+     *
+     * @return string[]|null  null = keine Regel greift (Fallback auf Sammellauf)
+     */
+    private function urls_for_product($product_id) {
+        $rules = $this->parse_purge_rules();
+        if (!$rules) {
+            return null;
+        }
+
+        // Marken-Slugs des Produkts
+        $slugs = ['brand' => [], 'cat' => []];
+        foreach (wp_get_post_terms($product_id, 'pwb-brand', ['fields' => 'slugs']) as $s) {
+            $slugs['brand'][$s] = true;
+        }
+        // Kategorien inkl. Eltern — eine Seite kann auf die Oberkategorie gefiltert sein
+        // (z.B. Seite auf „Ersatzteile", Produkt in „Ecm Ersatzteile").
+        foreach (wp_get_post_terms($product_id, 'product_cat', ['fields' => 'all']) as $term) {
+            if (is_wp_error($term) || !is_object($term)) {
+                continue;
+            }
+            $slugs['cat'][$term->slug] = true;
+            foreach (get_ancestors($term->term_id, 'product_cat') as $anc_id) {
+                $anc = get_term($anc_id, 'product_cat');
+                if ($anc && !is_wp_error($anc)) {
+                    $slugs['cat'][$anc->slug] = true;
+                }
+            }
+        }
+
+        $urls    = [];
+        $matched = false;
+        foreach ($rules as $rule) {
+            if (isset($slugs[$rule['type']][$rule['slug']])) {
+                $matched = true;
+                foreach ($rule['urls'] as $u) {
+                    $urls[$u] = true;
+                }
+            }
+        }
+
+        return $matched ? array_keys($urls) : null;
     }
 
     /** Deutsche URL + alle Weglot-Sprachvarianten. */
@@ -607,6 +746,100 @@ class Cloudways_Cache_Purge {
     }
 
     /**
+     * `wp cw-cache suggest-rules` — schlaegt Purge-Regeln aus den Seiteninhalten vor.
+     *
+     * Liest, wie die Seiten ihre Produkte listen, und leitet daraus Regelzeilen ab.
+     * Ausgabe ist ein VORSCHLAG zum Pruefen und Einfuegen — bewusst nicht automatisch
+     * angewendet: die Erkennung deckt drei Mechanismen ab ([ep_products],
+     * [ep_filtered_products], Uncode-loop) und kann Sonderfaelle uebersehen. Ein
+     * Mensch, der die Seite kennt, korrigiert das; ein stiller Parser nicht.
+     *
+     * ⚠ [vc_raw_html] ist base64 UND urlencoded — beides muss dekodiert werden,
+     * sonst findet man die Shortcodes nicht (Fehler bei der Erstanalyse 17.07.).
+     */
+    public function cli_suggest_rules() {
+        $pages = get_posts([
+            'post_type'      => 'page',
+            'post_status'    => 'publish',
+            'posts_per_page' => -1,
+        ]);
+
+        $by_slug = []; // slug => ['brand'|'cat' => true], url => true
+
+        foreach ($pages as $page) {
+            $content = $page->post_content;
+            if (preg_match_all('/\[vc_raw_html\](.*?)\[\/vc_raw_html\]/s', $content, $m)) {
+                foreach ($m[1] as $b64) {
+                    $content .= ' ' . urldecode(base64_decode(urldecode($b64)));
+                }
+            }
+
+            $url = get_permalink($page->ID);
+            if (!$url) {
+                continue;
+            }
+
+            // [ep_products ...] und [ep_filtered_products ...]
+            if (preg_match_all('/\[ep_(?:filtered_)?products([^\]]*)\]/', $content, $sc)) {
+                foreach ($sc[1] as $attrs) {
+                    if (preg_match('/\bbrand\s*=\s*"([^"]+)"/', $attrs, $b)) {
+                        foreach (explode(',', $b[1]) as $name) {
+                            $term = get_term_by('name', trim($name), 'pwb-brand');
+                            if ($term) {
+                                $by_slug['marke:' . $term->slug][$url] = true;
+                            }
+                        }
+                    }
+                    if (preg_match('/\bcategory\s*=\s*"([^"]+)"/', $attrs, $c)) {
+                        foreach (explode(',', $c[1]) as $slug) {
+                            $by_slug['kategorie:' . sanitize_title(trim($slug))][$url] = true;
+                        }
+                    }
+                }
+            }
+
+            // Uncode: loop="...post_type:product|tax_query:IDs..."
+            if (preg_match_all('/loop="([^"]*post_type:product[^"]*)"/', $content, $lp)) {
+                foreach ($lp[1] as $loop) {
+                    if (!preg_match('/tax_query:([0-9,]+)/', $loop, $tq)) {
+                        continue;
+                    }
+                    foreach (explode(',', $tq[1]) as $term_id) {
+                        $term = get_term((int) $term_id);
+                        if (!$term || is_wp_error($term)) {
+                            continue;
+                        }
+                        if ($term->taxonomy === 'pwb-brand') {
+                            $by_slug['marke:' . $term->slug][$url] = true;
+                        } elseif ($term->taxonomy === 'product_cat') {
+                            $by_slug['kategorie:' . $term->slug][$url] = true;
+                        }
+                        // andere Taxonomien (z.B. pa_accessoires, page_category) bewusst
+                        // ignoriert — daraus laesst sich keine saubere Regel ableiten.
+                    }
+                }
+            }
+        }
+
+        if (!$by_slug) {
+            \WP_CLI::warning('Keine Regeln ableitbar.');
+            return;
+        }
+
+        ksort($by_slug);
+        \WP_CLI::log('# Vorschlag — pruefen und in Einstellungen → Cloudways Cache einfuegen:');
+        \WP_CLI::log('');
+        foreach ($by_slug as $trigger => $urls) {
+            $paths = array_map(function ($u) {
+                return wp_parse_url($u, PHP_URL_PATH);
+            }, array_keys($urls));
+            \WP_CLI::log($trigger . ' => ' . implode(', ', $paths));
+        }
+        \WP_CLI::log('');
+        \WP_CLI::log(sprintf('# %d Regeln vorgeschlagen. Nicht erkannte Seiten faengt der Sammellauf ab.', count($by_slug)));
+    }
+
+    /**
      * `wp cw-cache refresh-listings` — frischt die Uebersichtsseiten auf, aber nur
      * wenn seit dem letzten Lauf ein Produkt geaendert wurde.
      *
@@ -915,6 +1148,7 @@ class Cloudways_Cache_Purge {
             'auto_purge_enabled'    => !empty($input['auto_purge_enabled']) ? 1 : 0,
             'refresh_after_purge'   => !empty($input['refresh_after_purge']) ? 1 : 0,
             'refresh_exclude'       => sanitize_textarea_field($input['refresh_exclude'] ?? "/kasse/\n/danke/\n/bestellbestaetigung/"),
+            'purge_rules'           => sanitize_textarea_field($input['purge_rules'] ?? ''),
         ];
     }
 
@@ -981,6 +1215,48 @@ class Cloudways_Cache_Purge {
                                 }
                                 ?>
                             </select>
+                        </td>
+                    </tr>
+                </table>
+
+                <h2>Purge-Regeln: welche Seiten hängen an welchen Produkten?</h2>
+                <table class="form-table">
+                    <tr>
+                        <th scope="row"><label>Regeln</label></th>
+                        <td>
+                            <textarea name="<?php echo $this->option_name; ?>[purge_rules]" rows="8" class="large-text code" placeholder="marke:ecm => /espressomaschine/alle-maschinen/, /espressomaschine/ecm/, /espressomuehle/ecm/"><?php echo esc_textarea($get('purge_rules', '')); ?></textarea>
+                            <p class="description">
+                                Eine Regel pro Zeile. Ändert die JTL-Wawi ein Produkt dieser Marke/Kategorie,
+                                werden <strong>genau diese Seiten</strong> sofort gepurged und neu vorgewärmt.<br>
+                                <code>marke:ecm =&gt; /espressomaschine/alle-maschinen/, /espressomaschine/ecm/, /espressomuehle/ecm/</code><br>
+                                <code>kategorie:espressomaschinen =&gt; /espressomaschine/alle-maschinen/</code><br><br>
+                                <strong>Sicherheitsnetz:</strong> Greift für ein geändertes Produkt <em>keine</em> Regel,
+                                läuft automatisch der Sammellauf (alle Menü-URLs, max. 15 Min Verzögerung).
+                                Unvollständige Regeln sind also unkritisch — sie machen es nur präziser und billiger.
+                                Kategorien wirken inklusive Unterkategorien.
+                                <br><em>Tipp: <code>wp cw-cache suggest-rules</code> schlägt Regeln aus den Seiteninhalten vor.</em>
+                            </p>
+                            <?php
+                            $brands = get_terms(['taxonomy' => 'pwb-brand', 'hide_empty' => true, 'number' => 40, 'orderby' => 'count', 'order' => 'DESC']);
+                            $cats   = get_terms(['taxonomy' => 'product_cat', 'hide_empty' => true, 'number' => 25, 'orderby' => 'count', 'order' => 'DESC']);
+                            ?>
+                            <details style="margin-top:10px;">
+                                <summary style="cursor:pointer;font-weight:600;">Verfügbare Marken- und Kategorie-Slugs anzeigen</summary>
+                                <div style="margin-top:8px;">
+                                    <p style="margin:6px 0;"><strong>Marken</strong> (<code>marke:</code>):</p>
+                                    <p style="font-family:monospace;font-size:12px;line-height:1.9;">
+                                        <?php if (!is_wp_error($brands)) foreach ($brands as $t) {
+                                            echo '<code>' . esc_html($t->slug) . '</code> <span style="color:#888;">(' . intval($t->count) . ')</span> &nbsp; ';
+                                        } ?>
+                                    </p>
+                                    <p style="margin:12px 0 6px;"><strong>Kategorien</strong> (<code>kategorie:</code>):</p>
+                                    <p style="font-family:monospace;font-size:12px;line-height:1.9;">
+                                        <?php if (!is_wp_error($cats)) foreach ($cats as $t) {
+                                            echo '<code>' . esc_html($t->slug) . '</code> <span style="color:#888;">(' . intval($t->count) . ')</span> &nbsp; ';
+                                        } ?>
+                                    </p>
+                                </div>
+                            </details>
                         </td>
                     </tr>
                 </table>
