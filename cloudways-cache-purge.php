@@ -3,7 +3,7 @@
  * Plugin Name: Cloudways Cache Purge
  * Plugin URI: https://github.com/4ddcommunication/cloudways-cache-purge
  * Description: Leert Breeze + Cloudways Server-Cache (Varnish) per Knopfdruck und wärmt danach die wichtigsten Seiten vor. Purged zusätzlich automatisch einzelne URLs bei Produkt-/Seiten-Änderungen (z.B. Preis/Bestand aus JTL-Wawi) und frischt nachts per WP-CLI den kompletten deutschen Bestand auf.
- * Version: 1.3.1
+ * Version: 1.3.2
  * Author: 4DD Communication GmbH
  * Author URI: https://4dd.de
  * License: GPL v2 or later
@@ -1098,6 +1098,8 @@ class Cloudways_Cache_Purge {
 
         update_option('cw_wdr_last_check', $now, false);
 
+        $this->wdr_guard_conditional_rules();
+
         if (!$grund && !isset($assoc['force'])) {
             \WP_CLI::log('Keine Preisaktions-Aenderung — nichts zu tun.');
             return;
@@ -1112,6 +1114,57 @@ class Cloudways_Cache_Purge {
         ], false);
 
         $this->cli_refresh([], ['purge-first' => true, 'concurrency' => 8]);
+    }
+
+    /**
+     * Waechter: Eine WDR-Regel mit Bedingungen (Warenkorbwert, Coupon,
+     * Bestellhistorie ...) rechnet SESSIONABHAENGIG. Modifiziert so eine
+     * Regel die Katalogpreise (kein apply_as_cart_rule), haengt der
+     * angezeigte Preis vom Betrachter ab — mit geteiltem Gaeste-Page-Cache
+     * (Breeze ?guest-Key) ist das ein Preis-Leak-Vektor. Regel 103 wurde
+     * deshalb am 17.07.2026 auf apply_as_cart_rule umgestellt (Vorbild
+     * 124/125); dieser Check verhindert, dass die naechste bedingte Regel
+     * das Muster still wieder einfuehrt. Laeuft mit jedem wdr-check-Cron
+     * (alle 5 Min). Bewusst nur simple-discount-artige Regeln (type in
+     * product_adjustments) — reine Cart-/BuyXGetY-Regeln aendern keine
+     * Katalogseiten.
+     */
+    private function wdr_guard_conditional_rules() {
+        global $wpdb;
+
+        $rows = $wpdb->get_results(
+            "SELECT id, title, conditions, product_adjustments
+             FROM {$wpdb->prefix}wdr_rules WHERE deleted = 0 AND enabled = 1"
+        );
+
+        $verdaechtig = [];
+        foreach ((array) $rows as $r) {
+            $conditions = json_decode((string) $r->conditions, true);
+            if (empty($conditions) || !is_array($conditions)) {
+                continue; // unbedingte Regel -> fuer alle Besucher gleich -> cachebar
+            }
+            $adj = json_decode((string) $r->product_adjustments, true);
+            if (empty($adj['type']) || !empty($adj['apply_as_cart_rule'])) {
+                continue;
+            }
+            $verdaechtig[] = "#{$r->id} {$r->title}";
+        }
+
+        if (!$verdaechtig) {
+            return;
+        }
+
+        $msg = 'WDR-Regel(n) mit Bedingungen aendern Katalogpreise sessionabhaengig '
+             . '(Preis-Leak-Vektor bei geteiltem Gaeste-Cache): ' . implode(' | ', $verdaechtig)
+             . ' — bitte auf "Apply as cart rule" umstellen (Vorbild: Regel 124/125, Doku: Changelog 17.07.2026).';
+        \WP_CLI::warning($msg);
+
+        // Max. 1 Mail pro Tag — der Cron laeuft alle 5 Minuten.
+        $last = (int) get_option('cw_wdr_guard_last_mail', 0);
+        if (time() - $last > DAY_IN_SECONDS) {
+            update_option('cw_wdr_guard_last_mail', time(), false);
+            wp_mail('a.ortmann@4dd.de', '[EP] WDR-Regel gefaehrdet Preis-Cache', $msg);
+        }
     }
 
     /**
