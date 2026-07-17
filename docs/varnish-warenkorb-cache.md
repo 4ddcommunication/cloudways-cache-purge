@@ -1,149 +1,140 @@
-# Warenkorb-Kunden bekommen ungecachte Seiten (3,5 s statt 0,07 s)
+# ⛔ Warenkorb-Cache: Vorschlag VERWORFEN — nicht umsetzen
 
-**Stand:** 2026-07-17 · **Status:** analysiert, **nicht umgesetzt** — braucht bewusste Freigabe
-**Betrifft:** espressoperfetto.de (Cloudways, Varnish + Breeze)
+**Stand:** 2026-07-17 · **Status:** ❌ **abgelehnt nach Gegenprüfung (Codex)**
+**Betrifft:** espressoperfetto.de (Cloudways, Varnish 6.0.18 + Breeze)
 
-## Das Problem
+> **Wer nur eine Zeile liest:** Der ursprünglich hier vorgeschlagene VCL-Block
+> (Warenkorb-Cookies strippen, damit Cart-Kunden gecachte Seiten bekommen) ist
+> **nicht deploymentfähig**. Er hätte Warenkörbe geleert, `add-to-cart`
+> zerschossen und in den Fremdsprachen Warenkorb-Seiten cachebar gemacht.
+> Codex-Session: `019f6fac-00e1-76b2-823a-9122007e0166`.
 
-Sobald ein Kunde etwas in den Warenkorb legt, setzt WooCommerce die Cookies
-`woocommerce_cart_hash`, `woocommerce_items_in_cart` und `wp_woocommerce_session_*`.
-Ab diesem Moment umgeht **jeder weitere Seitenaufruf den Varnish-Cache komplett**.
+## Was stimmt (bestätigt)
 
-Gemessen am 17.07.2026 (`curl -sI`, Header `x-cache`):
+- **Der Bypass existiert und kostet Tempo.** `/etc/varnish/recv/woocommerce.vcl:66-69`
+  piped bei `woocommerce_(cart|session)` und `wp_woocommerce_session`.
+  Gemessen: `woocommerce_cart_hash` allein → 3,40 s ohne HIT; `woocommerce_items_in_cart`
+  allein → 0,075 s **mit** HIT. Kunden mit Warenkorb surfen also spürbar langsamer.
+- **`custom-recv.vcl` läuft vor `recv/woocommerce.vcl`** (`cloudways.vcl:63` vs. `:69`).
+  Technisch wäre ein Eingriff dort also möglich — genau das ist aber das Problem
+  (s. „Reihenfolgefehler").
+- **Deutsche Slugs greifen nicht in der Cloudways-URL-Regel:** `/warenkorb/` matcht
+  kein `cart`, `/mein-konto/` kein `my-account`. Sie hängen wirklich nur am Cookie.
 
-| Request | TTFB | x-cache |
-|---|---|---|
-| Startseite anonym | **0,07 s** | `HIT`, age 422 |
-| Startseite mit `woocommerce_items_in_cart=1` allein | 0,075 s | `HIT` |
-| Startseite mit `woocommerce_cart_hash` | **3,40 s** | kein HIT |
-| Startseite mit `wp_woocommerce_session_*` | **3,61 s** | kein HIT |
-| Startseite mit `wordpress_logged_in_*` | **3,37 s** | kein HIT |
+## Warum der Vorschlag trotzdem falsch war — 5 widerlegte Annahmen
 
-Reproduzierbar über mehrere Messungen, auch mit nie gesehenen Cookie-Werten →
-**echter Bypass, kein Cache-Miss.**
+### 1. ❌ „Die Seiten sind personalisierungsfrei"
 
-**Der Kunde surft also ab dem ersten „In den Warenkorb" mit ~3,5 s pro Seite —
-also genau im Kaufprozess.** Anonyme Besucher sind mit 0,07 s unbetroffen.
+**Der HTML-Diff war methodisch wertlos.** Er wurde mit einem *erfundenen* Cookie
+(`woocommerce_cart_hash=abc123`) gemacht — dahinter lag keine echte Session, also
+sah WooCommerce einen **leeren Warenkorb** und personalisierte nichts. Erwartungsgemäß
+war das HTML identisch. Der Test hat schlicht zwei anonyme Seiten verglichen.
 
-## Die verantwortliche Regel
+**Real personalisiert wird sehr wohl.** `wp option get woo-discount-config-v2`:
+```json
+"modify_price_at_shop_page":"1",
+"modify_price_at_product_page":"1",
+"modify_price_at_category_page":"1"
+```
+Aktive Regel 103 (`wpuk_wdr_rules`): 10 % Rabatt bei `cart_subtotal >= 300` bzw.
+Coupon `sxoahelvrz`. WDR rechnet das laut `ManageDiscount.php:256-298` **auf Produkt-,
+Shop- und Kategorieseiten**. Ein Kunde mit >300 € im Korb sieht dort also **andere
+Preise** — genau das, was ein geteilter Cache verbreiten würde.
 
-`/etc/varnish/recv/woocommerce.vcl:66-69` (Cloudways-verwaltet):
+Dazu: `woocommerce_tax_based_on = shipping` → Steuer hängt am Kundenland
+(`class-wc-customer.php:185-207`).
 
-```vcl
-# EXCLUDE CACHE IF WORDPRESS/WOOCOMMERCE COOKIES ARE FOUND
-if (req.http.Cookie ~ "wordpress_logged_in|resetpass|wp-postpass|wordpress_(?!test_)[a-zA-Z0-9_]+|comment_|woocommerce_(cart|session)|wp_woocommerce_session") {
-        return (pipe);
-}
+Und die Behauptung „Cart-Fragments sind aus" stimmt nur halb: `disable-cart-fragments.php`
+dequeued mit Prio 999, **CheckoutWC hängt es mit Prio 10000 wieder ein**
+(`SideCart.php:175-212`); `wc-cart-fragments-js` ist live im HTML.
+
+### 2. ❌ „Weglot übersetzt die Slugs nicht"
+
+Falsch — der Test sah `HTTP 301` und folgte dem Redirect nicht:
+```
+/en/warenkorb/  → 301 → /en/card/
+/en/mein-konto/ → 301 → /en/my-account/
+                        /en/checkout-checkout/
+```
+**`/en/card/` matcht weder den Vorschlag noch die Cloudways-Regel `cart`.** Der
+Vorschlag hätte dort die Cookies gestrippt → **englische Warenkorb-Seite cachebar**.
+
+### 3. ❌ „Anonym kommt kein Set-Cookie"
+
+Der Test lief auf einer *Produktseite*. Die Warenkorb-Pfade sehr wohl:
+```
+HEAD /warenkorb/       → Set-Cookie: wp_woocommerce_session_...
+HEAD /kasse-checkout/  → Set-Cookie: wp_woocommerce_session_...
+HEAD /en/card/         → Set-Cookie: wp_woocommerce_session_...
 ```
 
-`woocommerce_(cart|session)` und `wp_woocommerce_session` sind die relevanten Teile.
+### 4. ❌ „cloudways.vcl:106/110 sind ein Cookie-Netz"
 
-## Warum der Bypass hier überflüssig ist
+Sind sie nicht: Z. 106 markiert **Fehlerstatus** uncachebar, Z. 110 nur
+`Content-Length: 0`. Der reguläre Woo-Pfad setzt dagegen pauschal
+`beresp.ttl = 30d` (`backend_response/woocommerce.vcl:7`, `varnish_default_ttl.vcl:2`).
 
-Der Bypass existiert, damit Kunden nicht die Warenkorb-Anzeige anderer Kunden
-sehen. **Auf dieser Site gibt es aber gar keine serverseitige Personalisierung.**
+### 5. ❌ Kritischer Reihenfolgefehler — der Block hätte Warenkörbe zerstört
 
-Nachgewiesen per HTML-Diff (identische URL, einmal anonym, einmal mit Cookies;
-Rauschpegel durch zwei anonyme Abrufe kalibriert):
+`custom-recv.vcl` läuft **vor** `woocommerce.vcl:49-52` (POST → pipe) und `:62`
+(`add-to-cart`/`wc-ajax` → pipe). Ablauf bei `POST /?wc-ajax=add_to_cart`:
+1. Block entfernt `wp_woocommerce_session_*`
+2. **erst danach** greift POST → pipe
+3. WooCommerce bekommt den POST **ohne bestehenden Warenkorb**
 
-| Seite | anon vs anon (Rauschen) | anon vs Warenkorb |
-|---|---|---|
-| `/espressomaschine/alle-maschinen/` | 70 Zeilen | **70 Zeilen** |
-| `/produkt/rocket-wassertank/` | 332 Zeilen | **334 Zeilen** |
-| Startseite | — | **68 Zeilen** |
+→ Warenkorb geleert, neue Session, Produkt landet im falschen Korb. Der Block hatte
+keine Methodenbeschränkung.
 
-Der Unterschied liegt exakt auf dem Rauschpegel (Nonces). Zusätzlich: Im HTML
-existiert **kein** `cart-contents-count`, `mini-cart` oder `widget_shopping_cart` —
-der Warenkorb wird vollständig clientseitig aufgebaut. Passt dazu, dass die
-Cart-Fragments bewusst abgeschaltet sind (`mu-plugins/disable-cart-fragments.php`).
-
-**Ergebnis: Warenkorb-Kunden zahlen 3,5 s für exakt die Seite, die anonym aus dem
-Cache in 0,07 s käme.**
-
-## ⚠ Die Falle: /warenkorb/ und /mein-konto/ hängen NUR am Cookie
-
-Die URL-Ausschlussregel darüber (`woocommerce.vcl:62`) matcht auf
-`cart|my-account|checkout` — **die deutschen Slugs greifen da nicht:**
-
-| URL | von der URL-Regel geschützt? |
-|---|---|
-| `/kasse-checkout/` | ja (enthält „checkout") |
-| `/warenkorb/` | **NEIN** |
-| `/mein-konto/` | **NEIN** |
-
-Diese beiden Seiten sind heute **ausschließlich** durch den Cookie-Bypass geschützt.
-Wer die Cookies strippt, ohne die URLs auszuschließen, macht sie cachebar —
-**dann bekäme ein Kunde den Warenkorb eines anderen ausgeliefert.**
-
-Entwarnung bei der Sprach-Enumerierung: **Weglot übersetzt die Slugs nicht.**
-Der Warenkorb ist in allen 7 Sprachen `/…/warenkorb/` (geprüft für en/fr/es/nl/it/pl).
-Eine Regel deckt also alle Sprachen ab.
-
-## Vorschlag
-
-Die App-eigene `custom-recv.vcl` wird in `cloudways.vcl:63`
-(`additional_vcls/recv.vcl`) eingebunden — also **vor** `recv/woocommerce.vcl:69`.
-Dort lassen sich die Cookies entfernen, bevor die Bypass-Regel sie sieht. Die
-Cloudways-Datei bleibt unangetastet.
-
-Datei: `/home/1312124.cloudwaysapps.com/mnpttwzgfv/conf/custom-recv.vcl`
-
-```vcl
-# Warenkorb-Kunden sollen gecachte Seiten bekommen: Die Seiten sind
-# personalisierungsfrei (HTML-Diff anon vs. Warenkorb = Rauschpegel), der
-# Bypass kostet nur 3,5 s statt 0,07 s.
-#
-# NICHT anfassen bei:
-#  - eingeloggten Usern (Adminbar, evtl. B2B-Preise)
-#  - Warenkorb/Kasse/Konto — die deutschen Slugs greifen NICHT in der
-#    URL-Regel von woocommerce.vcl:62 und haengen nur am Cookie!
-if (req.url !~ "/(warenkorb|mein-konto|kasse)" &&
-    req.http.Cookie !~ "wordpress_logged_in") {
-    set req.http.Cookie = regsuball(req.http.Cookie,
-        "(^|; ?)(woocommerce_cart_hash|woocommerce_items_in_cart|wp_woocommerce_session_[^=]*)=[^;]*", "");
-    if (req.http.Cookie ~ "^\s*$") { unset req.http.Cookie; }
-}
+Weitere Fehlklassifikationen (Codex-Simulation gegen die Regex):
+```
+STRIPPED  /en/card/                 ← Leak
+STRIPPED  /en/checkout-checkout/    ← Leak
+STRIPPED  /en/my-account/orders/    ← Leak
+STRIPPED  /WARENKORB/               ← Gross-/Kleinschreibung
+STRIPPED  /%77arenkorb/             ← URL-kodiert
+STRIPPED  /?add-to-cart=123         ← zerschiesst Warenkorb
 ```
 
-### Warum das mit Set-Cookie sicher ist
+## ⚠ Nebenbefund: möglicher Breeze-Poisoning-Pfad (BESTEHT SCHON HEUTE)
 
-Gemessen: Der **anonyme** Pfad sendet **kein** `Set-Cookie` (`x-cache: MISS`,
-echter Render, keine Set-Cookie-Header). Erst wenn ein Session-Cookie
-mitkommt, antwortet die Site mit `set-cookie: mailchimp_landing_site=…` und
-räumt ungültige Cart-Cookies ab.
+Unabhängig vom Vorschlag: **Breeze prüft nur `wordpress_logged_in_*`**
+(`inc/cache/execute-cache.php:141-171`), **nicht** die Woo-Cookies. Alle nicht
+eingeloggten Anfragen teilen sich einen `?guest`-Cachekey (Z. 128-139, 493-508).
+`DONOTCACHEPAGE` setzt WooCommerce nur für Cart/Checkout/My-Account
+(`class-wc-cache-helper.php:48-58`), **nicht** für Besucher mit aktivem Cart-Cookie.
 
-Da das Strippen den Request **anonym** macht, entsteht auch kein Set-Cookie →
-nichts Personalisiertes landet im Cache. Zusätzlich hat `cloudways.vcl`
-(vcl_backend_response, Z. 106/110) bereits `beresp.uncacheable`-Logik als Netz.
+→ Ein cart-/couponabhängiger WDR-Preis (Regel 103) könnte als gemeinsamer
+Breeze-Body gespeichert und an andere Gäste ausgeliefert werden.
 
-## Erwarteter Gewinn
+**Status: Hypothese, nicht nachgewiesen.** Codex hat 1.301 Breeze-Objekte geprüft:
+kein serverseitiger Mini-Cart-Marker gefunden (CheckoutWC lädt den Side-Cart
+clientseitig). Der Pfad für personalisierte **Preise** bleibt aber offen.
+**Das gehört unabhängig geprüft.**
 
-**Warenkorb-Kunden: 3,5 s → 0,07 s pro Seite.** Faktor ~50, und zwar genau im
-Kaufprozess. Zusätzlich sinkt die PHP-Last spürbar — ein Teil der 43.375
-PHP-Requests/8 h (Ø 3,20 s) entfällt.
+Breeze-Ausschlüsse enthalten zudem nur die deutschen Slugs
+(`/warenkorb/*`, `/kasse-checkout/*`, `/mein-konto/*`) — **nicht** `/en/card/` & Co.
 
-## Testplan vor dem Scharfschalten
+## Falls das Thema je wieder aufgegriffen wird
 
-1. **Kein Cart-Leak:** Zwei verschiedene Sessions Produkte in den Warenkorb legen,
-   `/warenkorb/` beidseitig aufrufen → jeder sieht NUR seinen Warenkorb.
-   `curl -sI /warenkorb/` darf **nie** `x-cache: HIT` liefern.
-2. **Checkout unberührt:** `/kasse-checkout/` mit Session → kein HIT, Bestellung
-   testweise bis zur Zahlungsauswahl durchklicken.
-3. **Eingeloggt unberührt:** Als Admin im Frontend → kein HIT (Adminbar sichtbar).
-4. **Gewinn belegen:** `curl -sI -b "woocommerce_cart_hash=abc" /` → muss `HIT`
-   und < 0,2 s liefern.
-5. **Sprachen:** dieselben Tests auf `/en/`, `/fr/`.
-6. **Rollback:** Zeilen aus `custom-recv.vcl` entfernen, `varnishadm vcl.load` bzw.
-   Cloudways-Cache-Purge. ⚠ Cloudways kann `custom-recv.vcl` bei Änderungen über
-   das Panel („Exclude URL from Varnish") **überschreiben** — nach solchen
-   Aktionen prüfen, ob der Block noch drinsteht.
+Vorbedingungen, die **vorher** erfüllt sein müssen:
 
-## Offene Risiken
+1. **Beweisen, dass die Seiten personalisierungsfrei sind — mit ECHTER Session.**
+   Zwei gültige WooCommerce-Sessions aufbauen (eine mit >300 € Warenkorb, eine leer),
+   dann HTML vergleichen. Der Fake-Cookie-Test ist wertlos.
+2. **WDR-Preisänderung auf Shop-/Kategorie-/Produktseiten abschalten**
+   (`modify_price_at_*` = 0) oder nachweisen, dass keine Regel cart-/couponabhängig ist.
+3. **Alle Weglot-Slugs enumerieren** — über die tatsächlichen Sprachlinks, nicht geraten.
+   Bekannt: `/en/card/`, `/en/checkout-checkout/`, `/en/my-account/`.
+4. **Methoden- und Query-Schutz:** nur GET, und `add-to-cart`/`wc-ajax`/`s=` vorher
+   ausschliessen — der Block läuft vor den Cloudways-Pipes.
+5. **Breeze zuerst klären** (s. Nebenbefund), sonst verlagert sich das Problem nur.
+6. **Erst dann** Testplan: zwei echte Sessions, Cart-Leak-Test, Checkout-Durchlauf.
 
-- **Cloudways überschreibt `custom-recv.vcl`** bei Panel-Aktionen → Block wäre weg,
-  Verhalten fiele auf „langsam aber sicher" zurück. Unschön, aber ungefährlich.
-- **Wenn später ein serverseitiger Mini-Warenkorb eingebaut wird** (z.B. Cart-Fragments
-  reaktiviert), wird dieser Block **sofort gefährlich**. Dann muss er weg. Deshalb
-  hier dokumentiert und im VCL kommentiert.
-- **B2B-Preise:** Falls es je rollenabhängige Preise für nicht eingeloggte User gäbe,
-  wäre der Diff-Nachweis hinfällig. Aktuell: nicht der Fall.
+## Lehren
+
+- **Ein erfundenes Cookie ist keine Session.** Der Diff verglich zwei anonyme Seiten.
+- **301 ist kein Ergebnis.** Der Weglot-Test hat den Redirect nicht verfolgt.
+- **Reihenfolge in der VCL ist Semantik.** „Läuft vorher" war als Vorteil notiert —
+  es war der Grund für den schlimmsten Fehler.
+- Bei allem, was Warenkörbe berührt: **gegenprüfen lassen.** Diese Analyse sah
+  sauber aus und war es an fünf Stellen nicht.

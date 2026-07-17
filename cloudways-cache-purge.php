@@ -75,10 +75,19 @@ class Cloudways_Cache_Purge {
             add_action('shutdown', [$this, 'flush_purge_queue'], 999);
         }
 
+        // --- Woo Discount Rules (v1.4.0) ---
+        // WDR speichert Regeln in einer EIGENEN Tabelle (wpuk_wdr_rules), nicht am
+        // Produkt. Eine Preisaktion schreibt also kein _price-Meta -> die Hooks oben
+        // feuern nicht, und die Aktion waere auf gecachten Seiten unsichtbar.
+        add_action('advanced_woo_discount_rules_after_save_rule', [$this, 'on_wdr_change'], 10, 0);
+        add_action('advanced_woo_discount_rules_after_delete_rule', [$this, 'on_wdr_change'], 10, 0);
+        add_action('advanced_woo_discount_rules_after_delete_rules', [$this, 'on_wdr_change'], 10, 0);
+
         if (defined('WP_CLI') && WP_CLI) {
             \WP_CLI::add_command('cw-cache refresh', [$this, 'cli_refresh']);
             \WP_CLI::add_command('cw-cache refresh-listings', [$this, 'cli_refresh_listings']);
             \WP_CLI::add_command('cw-cache suggest-rules', [$this, 'cli_suggest_rules']);
+            \WP_CLI::add_command('cw-cache wdr-check', [$this, 'cli_wdr_check']);
             \WP_CLI::add_command('cw-cache purge-url', [$this, 'cli_purge_url']);
         }
     }
@@ -275,6 +284,23 @@ class Cloudways_Cache_Purge {
             'urls'    => $done,
             'capped'  => $capped,
         ], false);
+    }
+
+    /**
+     * Eine Woo-Discount-Rules-Regel wurde gespeichert/geloescht.
+     *
+     * Umfang bewusst NICHT aus WDRs `filters`-JSON abgeleitet: Eine Regel kann
+     * jedes Produkt treffen („15 % auf alles"), und ein Parser dafuer haette den
+     * bekannten stillen Fehlermodus — uebersieht er etwas, zeigt die Seite einen
+     * falschen Preis. Bei Rabattaktionen ist das nicht nur unschoen, sondern
+     * rechtlich heikel. Deshalb: Vollrefresh.
+     *
+     * Nur markieren, nicht sofort starten: Beim Einrichten einer Aktion werden
+     * oft mehrere Regeln nacheinander gespeichert (Produkte ausschliessen,
+     * Prozente anpassen). Der Cron buendelt das zu EINEM Lauf.
+     */
+    public function on_wdr_change() {
+        update_option('cw_wdr_dirty', time(), false);
     }
 
     /** AJAX: Regelvorschlaege fuer den Button „Vorschlaege laden" im Backend. */
@@ -996,6 +1022,65 @@ class Cloudways_Cache_Purge {
     }
 
     /**
+     * `wp cw-cache wdr-check` — reagiert auf Preisaktionen (Woo Discount Rules).
+     *
+     * Deckt ZWEI Luecken ab:
+     * 1. Regel gespeichert/geloescht -> Flag cw_wdr_dirty (via on_wdr_change).
+     * 2. **Zeitgesteuerter Start/Stopp** -> feuert KEINEN Hook! Eine Regel mit
+     *    date_from = 13:00 aendert um 13:00 die Preise, ohne dass irgendetwas
+     *    passiert. Deshalb prueft dieser Befehl die Tabelle direkt auf Grenzen,
+     *    die seit dem letzten Lauf ueberschritten wurden.
+     *
+     * Beim Treffer: Vollrefresh mit --purge-first (siehe dort — Preise muessen
+     * SOFORT korrekt sein, Geschwindigkeit darf nachkommen).
+     *
+     * ## OPTIONS
+     * [--force] : Auch ohne erkannte Aenderung laufen.
+     */
+    public function cli_wdr_check($args, $assoc = []) {
+        global $wpdb;
+
+        $dirty = (int) get_option('cw_wdr_dirty', 0);
+        $last  = (int) get_option('cw_wdr_last_check', time() - 600);
+        $now   = time();
+
+        $grund = '';
+        if ($dirty) {
+            $grund = 'Regel gespeichert/geloescht';
+        } else {
+            // Zeitgrenzen, die seit dem letzten Lauf ueberschritten wurden.
+            $table = $wpdb->prefix . 'wdr_rules';
+            $treffer = $wpdb->get_var($wpdb->prepare(
+                "SELECT COUNT(*) FROM {$table}
+                 WHERE deleted = 0 AND enabled = 1
+                   AND ( (date_from IS NOT NULL AND date_from > %d AND date_from <= %d)
+                      OR (date_to   IS NOT NULL AND date_to   > %d AND date_to   <= %d) )",
+                $last, $now, $last, $now
+            ));
+            if ($treffer > 0) {
+                $grund = sprintf('%d zeitgesteuerte Regel(n) haben gerade begonnen/geendet', $treffer);
+            }
+        }
+
+        update_option('cw_wdr_last_check', $now, false);
+
+        if (!$grund && !isset($assoc['force'])) {
+            \WP_CLI::log('Keine Preisaktions-Aenderung — nichts zu tun.');
+            return;
+        }
+
+        delete_option('cw_wdr_dirty');
+        \WP_CLI::log('Preisaktion erkannt: ' . ($grund ?: 'erzwungen') . ' -> Vollrefresh mit purge-first');
+
+        update_option('cw_last_wdr_refresh', [
+            'time'  => current_time('mysql'),
+            'grund' => $grund ?: 'force',
+        ], false);
+
+        $this->cli_refresh([], ['purge-first' => true, 'concurrency' => 8]);
+    }
+
+    /**
      * `wp cw-cache refresh` — purged + waermt den kompletten deutschen Bestand.
      *
      * Bewusst als WP-CLI und nicht als wp-cron: Auf Cloudways funktioniert
@@ -1011,6 +1096,7 @@ class Cloudways_Cache_Purge {
      * [--concurrency=<n>]  : Parallele Requests (Default 8).
      * [--limit=<n>]        : Nur die ersten n URLs (Test).
      * [--types=<liste>]    : Post-Types, Default "page,product".
+     * [--purge-first]      : ERST alles purgen, DANN waermen. Fuer Preisaktionen.
      * [--dry-run]          : Nur zeigen, was passieren wuerde.
      */
     public function cli_refresh($args, $assoc = []) {
@@ -1018,6 +1104,7 @@ class Cloudways_Cache_Purge {
         $limit       = (int) ($assoc['limit'] ?? 0);
         $types       = array_filter(array_map('trim', explode(',', $assoc['types'] ?? 'page,product')));
         $dry         = isset($assoc['dry-run']);
+        $purge_first = isset($assoc['purge-first']);
 
         $urls = $this->collect_refresh_urls($types);
         if ($limit > 0) {
@@ -1039,20 +1126,53 @@ class Cloudways_Cache_Purge {
             return;
         }
 
-        $started  = microtime(true);
-        $progress = \WP_CLI\Utils\make_progress_bar('Refresh', $total);
+        $started = microtime(true);
         $ok = 0;
 
-        foreach (array_chunk($urls, $concurrency) as $chunk) {
-            foreach ($chunk as $url) {
+        if ($purge_first) {
+            // Fuer Preisaktionen: ERST alles purgen, DANN waermen.
+            //
+            // Der normale Modus purged+waermt URL fuer URL — bei 1.669 URLs zeigt
+            // die letzte dann noch ~75 Min den ALTEN Preis. Bei einem Rabatt ist
+            // das nicht nur unschoen, sondern rechtlich heikel.
+            //
+            // Purgen ist billig (URLPURGE = Ban, ~10 ms) -> nach ~1-2 Min sind alle
+            // Preise korrekt. Das Waermen laeuft danach; bis eine Seite dran ist,
+            // zahlt ihr erster Besucher einmalig ~7 s. Korrektheit schlaegt Tempo.
+            \WP_CLI::log('Phase 1/2: purgen (Preise sofort korrekt) …');
+            $p = \WP_CLI\Utils\make_progress_bar('Purge', $total);
+            foreach ($urls as $url) {
                 $this->purge_url($url);
+                $p->tick();
             }
-            $ok += $this->fetch_parallel($chunk);
-            foreach ($chunk as $_) {
-                $progress->tick();
+            $p->finish();
+            \WP_CLI::log(sprintf('Alle %d URLs gepurged nach %s s — ab jetzt zeigt keine Seite mehr den alten Preis.',
+                $total, round(microtime(true) - $started, 1)));
+
+            \WP_CLI::log('Phase 2/2: waermen …');
+            $progress = \WP_CLI\Utils\make_progress_bar('Waermen', $total);
+            foreach (array_chunk($urls, $concurrency) as $chunk) {
+                $ok += $this->fetch_parallel($chunk);
+                foreach ($chunk as $_) {
+                    $progress->tick();
+                }
             }
+            $progress->finish();
+        } else {
+            // Normalfall (Nacht-Cron): pro URL purgen + sofort holen. Das
+            // Kaltfenster bleibt so sekundenkurz statt „ganze Nacht kalt".
+            $progress = \WP_CLI\Utils\make_progress_bar('Refresh', $total);
+            foreach (array_chunk($urls, $concurrency) as $chunk) {
+                foreach ($chunk as $url) {
+                    $this->purge_url($url);
+                }
+                $ok += $this->fetch_parallel($chunk);
+                foreach ($chunk as $_) {
+                    $progress->tick();
+                }
+            }
+            $progress->finish();
         }
-        $progress->finish();
 
         $duration = round(microtime(true) - $started, 1);
         update_option('cw_last_refresh', [
