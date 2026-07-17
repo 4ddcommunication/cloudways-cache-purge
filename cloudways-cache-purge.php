@@ -52,6 +52,7 @@ class Cloudways_Cache_Purge {
         add_action('wp_head', [$this, 'add_button_styles']);
         add_action('admin_head', [$this, 'add_button_styles']);
         add_action(self::CRON_HOOK, [$this, 'run_prewarm'], 10, 1);
+        add_action('wp_ajax_cw_suggest_rules', [$this, 'ajax_suggest_rules']);
 
         // --- Auto-Purge einzelner URLs (v1.3.0) ---
         if ($this->auto_purge_enabled()) {
@@ -235,6 +236,15 @@ class Cloudways_Cache_Purge {
             'urls'    => $done,
             'capped'  => $capped,
         ], false);
+    }
+
+    /** AJAX: Regelvorschlaege fuer den Button „Vorschlaege laden" im Backend. */
+    public function ajax_suggest_rules() {
+        check_ajax_referer('cw_suggest_rules', 'nonce');
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error('Keine Berechtigung');
+        }
+        wp_send_json_success($this->build_suggested_rules());
     }
 
     /**
@@ -758,10 +768,40 @@ class Cloudways_Cache_Purge {
      * sonst findet man die Shortcodes nicht (Fehler bei der Erstanalyse 17.07.).
      */
     public function cli_suggest_rules() {
+        $by_slug = $this->build_suggested_rules();
+
+        if (!$by_slug) {
+            \WP_CLI::warning('Keine Regeln ableitbar.');
+            return;
+        }
+
+        \WP_CLI::log('# Vorschlag — pruefen und in Einstellungen → Cloudways Cache einfuegen:');
+        \WP_CLI::log('');
+        foreach ($by_slug as $trigger => $paths) {
+            \WP_CLI::log($trigger . ' => ' . implode(', ', $paths));
+        }
+        \WP_CLI::log('');
+        \WP_CLI::log(sprintf('# %d Regeln vorgeschlagen. Nicht erkannte Seiten faengt der Sammellauf ab.', count($by_slug)));
+    }
+
+    /**
+     * Leitet Regelvorschlaege aus den Seiteninhalten ab.
+     *
+     * Gemeinsame Quelle fuer CLI und Admin-UI.
+     *
+     * @return array  'marke:slug'|'kategorie:slug' => string[] (Pfade)
+     */
+    public function build_suggested_rules() {
         $pages = get_posts([
             'post_type'      => 'page',
             'post_status'    => 'publish',
             'posts_per_page' => -1,
+        ]);
+
+        // Test-/Copy-Altlasten, die zwar publish sind, aber keine echten Zielseiten.
+        $junk = apply_filters('cw_cache_suggest_junk', [
+            '/startseite_neu/', '/startseite_neu-copy/', '/startseite_neu-copy-copy/',
+            '/maschinen-filter-test/', '/test-ajaaxo/',
         ]);
 
         $by_slug = []; // slug => ['brand'|'cat' => true], url => true
@@ -821,22 +861,23 @@ class Cloudways_Cache_Purge {
             }
         }
 
-        if (!$by_slug) {
-            \WP_CLI::warning('Keine Regeln ableitbar.');
-            return;
+        ksort($by_slug);
+
+        $result = [];
+        foreach ($by_slug as $trigger => $urls) {
+            $paths = [];
+            foreach (array_keys($urls) as $u) {
+                $path = wp_parse_url($u, PHP_URL_PATH);
+                if ($path && !in_array($path, $junk, true)) {
+                    $paths[] = $path;
+                }
+            }
+            if ($paths) {
+                $result[$trigger] = $paths;
+            }
         }
 
-        ksort($by_slug);
-        \WP_CLI::log('# Vorschlag — pruefen und in Einstellungen → Cloudways Cache einfuegen:');
-        \WP_CLI::log('');
-        foreach ($by_slug as $trigger => $urls) {
-            $paths = array_map(function ($u) {
-                return wp_parse_url($u, PHP_URL_PATH);
-            }, array_keys($urls));
-            \WP_CLI::log($trigger . ' => ' . implode(', ', $paths));
-        }
-        \WP_CLI::log('');
-        \WP_CLI::log(sprintf('# %d Regeln vorgeschlagen. Nicht erkannte Seiten faengt der Sammellauf ab.', count($by_slug)));
+        return $result;
     }
 
     /**
@@ -1074,6 +1115,232 @@ class Cloudways_Cache_Purge {
     }
 
     /**
+     * Visueller Regel-Editor.
+     *
+     * Speicherformat bleibt die Textzeile („marke:ecm => /a/, /b/") — der Editor
+     * liest sie ein und schreibt sie beim Speichern in ein verstecktes Textarea
+     * zurueck. Backend/CLI bleiben damit unveraendert, und wer will, kann die
+     * Rohansicht weiter nutzen.
+     */
+    private function render_rules_editor($raw) {
+        $brands = get_terms(['taxonomy' => 'pwb-brand', 'hide_empty' => true, 'orderby' => 'count', 'order' => 'DESC']);
+        $cats   = get_terms(['taxonomy' => 'product_cat', 'hide_empty' => true, 'orderby' => 'count', 'order' => 'DESC']);
+
+        $terms = ['brand' => [], 'cat' => []];
+        if (!is_wp_error($brands)) {
+            foreach ($brands as $t) {
+                $terms['brand'][] = ['slug' => $t->slug, 'name' => $t->name, 'count' => (int) $t->count];
+            }
+        }
+        if (!is_wp_error($cats)) {
+            foreach ($cats as $t) {
+                $terms['cat'][] = ['slug' => $t->slug, 'name' => $t->name, 'count' => (int) $t->count];
+            }
+        }
+
+        $pages = [];
+        foreach (get_posts(['post_type' => 'page', 'post_status' => 'publish', 'posts_per_page' => -1, 'orderby' => 'title', 'order' => 'ASC']) as $p) {
+            $path = wp_parse_url(get_permalink($p->ID), PHP_URL_PATH);
+            if ($path) {
+                $pages[] = ['path' => $path, 'title' => $p->post_title];
+            }
+        }
+        ?>
+        <h2>Purge-Regeln: welche Seiten hängen an welchen Produkten?</h2>
+        <p class="description" style="max-width:900px;margin-bottom:12px;">
+            Ändert die JTL-Wawi ein Produkt einer Marke/Kategorie, werden <strong>genau die hier hinterlegten Seiten</strong>
+            sofort gepurged und neu vorgewärmt.
+            <strong>Sicherheitsnetz:</strong> Greift für ein geändertes Produkt keine Regel, läuft automatisch der
+            Sammellauf über alle Menü-URLs (max. 15 Min Verzögerung) — <em>unvollständige Regeln sind also unkritisch,
+            sie machen es nur präziser und billiger</em>.
+            Kategorien wirken <strong>inklusive Unterkategorien</strong>: Eine ECM-Maschine
+            (<code>ecm-maschinen-espressomaschinen</code>) löst deshalb auch <code>espressomaschinen</code> aus
+            und purged die Übersicht mit.
+        </p>
+
+        <p>
+            <button type="button" class="button" id="cw-add-rule">+ Regel hinzufügen</button>
+            <button type="button" class="button" id="cw-suggest">Vorschläge aus Seiteninhalten laden</button>
+            <button type="button" class="button-link" id="cw-toggle-raw" style="margin-left:10px;">Rohansicht ein/aus</button>
+            <span id="cw-rule-count" style="margin-left:10px;color:#666;"></span>
+        </p>
+
+        <table class="widefat striped" id="cw-rules-table" style="max-width:1100px;">
+            <thead>
+                <tr>
+                    <th style="width:110px;">Auslöser</th>
+                    <th style="width:280px;">Marke / Kategorie</th>
+                    <th>Diese Seiten purgen</th>
+                    <th style="width:40px;"></th>
+                </tr>
+            </thead>
+            <tbody></tbody>
+        </table>
+
+        <textarea name="<?php echo $this->option_name; ?>[purge_rules]" id="cw-rules-raw" rows="10" class="large-text code" style="display:none;margin-top:10px;"><?php echo esc_textarea($raw); ?></textarea>
+
+        <script>
+        (function(){
+            var TERMS = <?php echo wp_json_encode($terms); ?>;
+            var PAGES = <?php echo wp_json_encode($pages); ?>;
+            var AJAX  = <?php echo wp_json_encode(admin_url('admin-ajax.php')); ?>;
+            var NONCE = <?php echo wp_json_encode(wp_create_nonce('cw_suggest_rules')); ?>;
+
+            var raw   = document.getElementById('cw-rules-raw');
+            var tbody = document.querySelector('#cw-rules-table tbody');
+            var count = document.getElementById('cw-rule-count');
+
+            function parseRaw(text) {
+                var rules = [];
+                (text || '').split('\n').forEach(function(line){
+                    line = line.trim();
+                    if (!line || line.indexOf('=>') === -1) return;
+                    var parts = line.split('=>');
+                    var trig  = parts[0].trim().split(':');
+                    if (trig.length < 2) return;
+                    var type = /^(marke|brand)$/i.test(trig[0].trim()) ? 'brand' : 'cat';
+                    rules.push({
+                        type: type,
+                        slug: trig.slice(1).join(':').trim(),
+                        pages: parts.slice(1).join('=>').split(',').map(function(s){ return s.trim(); }).filter(Boolean)
+                    });
+                });
+                return rules;
+            }
+
+            function serialize() {
+                var lines = [];
+                Array.prototype.forEach.call(tbody.querySelectorAll('tr'), function(tr){
+                    var type = tr.querySelector('.cw-type').value;
+                    var slug = tr.querySelector('.cw-slug').value;
+                    var pages = Array.prototype.map.call(tr.querySelectorAll('.cw-chip'), function(c){ return c.dataset.path; });
+                    if (slug && pages.length) {
+                        lines.push((type === 'brand' ? 'marke:' : 'kategorie:') + slug + ' => ' + pages.join(', '));
+                    }
+                });
+                raw.value = lines.join('\n');
+                count.textContent = lines.length + ' Regel(n) aktiv';
+            }
+
+            function chip(path) {
+                var page = PAGES.find(function(p){ return p.path === path; });
+                var s = document.createElement('span');
+                s.className = 'cw-chip';
+                s.dataset.path = path;
+                s.style.cssText = 'display:inline-flex;align-items:center;gap:6px;background:#f0f0f1;border:1px solid #c3c4c7;border-radius:3px;padding:2px 6px;margin:2px 4px 2px 0;font-size:12px;';
+                s.innerHTML = '<span title="' + (page ? page.title.replace(/"/g,'&quot;') : '') + '">' + path + '</span>';
+                var x = document.createElement('a');
+                x.href = '#'; x.textContent = '×';
+                x.style.cssText = 'text-decoration:none;color:#b32d2e;font-weight:700;';
+                x.onclick = function(e){ e.preventDefault(); s.remove(); serialize(); };
+                s.appendChild(x);
+                return s;
+            }
+
+            function fillSlugs(sel, type, current) {
+                sel.innerHTML = '';
+                (TERMS[type] || []).forEach(function(t){
+                    var o = document.createElement('option');
+                    o.value = t.slug;
+                    o.textContent = t.name + ' (' + t.count + ')';
+                    if (t.slug === current) o.selected = true;
+                    sel.appendChild(o);
+                });
+                if (current && !(TERMS[type] || []).some(function(t){ return t.slug === current; })) {
+                    var o = document.createElement('option');
+                    o.value = current; o.textContent = current + ' (unbekannt)'; o.selected = true;
+                    sel.appendChild(o);
+                }
+            }
+
+            function addRow(rule) {
+                rule = rule || {type:'brand', slug:'', pages:[]};
+                var tr = document.createElement('tr');
+
+                var td1 = document.createElement('td');
+                var type = document.createElement('select');
+                type.className = 'cw-type';
+                type.innerHTML = '<option value="brand">Marke</option><option value="cat">Kategorie</option>';
+                type.value = rule.type;
+                td1.appendChild(type);
+
+                var td2 = document.createElement('td');
+                var slug = document.createElement('select');
+                slug.className = 'cw-slug';
+                slug.style.maxWidth = '270px';
+                fillSlugs(slug, rule.type, rule.slug);
+                td2.appendChild(slug);
+
+                var td3 = document.createElement('td');
+                var box = document.createElement('div');
+                box.className = 'cw-chips';
+                rule.pages.forEach(function(p){ box.appendChild(chip(p)); });
+                var add = document.createElement('select');
+                add.style.cssText = 'max-width:320px;margin-top:4px;';
+                add.innerHTML = '<option value="">+ Seite hinzufügen …</option>' + PAGES.map(function(p){
+                    return '<option value="' + p.path + '">' + p.title.replace(/</g,'&lt;') + ' — ' + p.path + '</option>';
+                }).join('');
+                add.onchange = function(){
+                    if (!add.value) return;
+                    if (!box.querySelector('[data-path="' + add.value + '"]')) { box.appendChild(chip(add.value)); }
+                    add.value = ''; serialize();
+                };
+                td3.appendChild(box); td3.appendChild(add);
+
+                var td4 = document.createElement('td');
+                var del = document.createElement('a');
+                del.href = '#'; del.textContent = '🗑'; del.title = 'Regel löschen';
+                del.style.textDecoration = 'none';
+                del.onclick = function(e){ e.preventDefault(); tr.remove(); serialize(); };
+                td4.appendChild(del);
+
+                type.onchange = function(){ fillSlugs(slug, type.value, ''); serialize(); };
+                slug.onchange = serialize;
+
+                tr.appendChild(td1); tr.appendChild(td2); tr.appendChild(td3); tr.appendChild(td4);
+                tbody.appendChild(tr);
+            }
+
+            parseRaw(raw.value).forEach(addRow);
+            serialize();
+
+            document.getElementById('cw-add-rule').onclick = function(){ addRow(); serialize(); };
+            document.getElementById('cw-toggle-raw').onclick = function(){
+                raw.style.display = raw.style.display === 'none' ? 'block' : 'none';
+            };
+            document.getElementById('cw-suggest').onclick = function(){
+                var btn = this;
+                btn.disabled = true; btn.textContent = 'Lade …';
+                var body = new URLSearchParams({action:'cw_suggest_rules', nonce:NONCE});
+                fetch(AJAX, {method:'POST', credentials:'same-origin', body:body})
+                    .then(function(r){ return r.json(); })
+                    .then(function(res){
+                        if (!res.success) { alert('Fehler: ' + res.data); return; }
+                        var n = Object.keys(res.data).length;
+                        if (!confirm(n + ' Vorschläge gefunden. Bestehende Regeln ersetzen?')) return;
+                        tbody.innerHTML = '';
+                        Object.keys(res.data).forEach(function(trig){
+                            var p = trig.split(':');
+                            addRow({
+                                type: /^(marke|brand)$/i.test(p[0]) ? 'brand' : 'cat',
+                                slug: p.slice(1).join(':'),
+                                pages: res.data[trig]
+                            });
+                        });
+                        serialize();
+                    })
+                    .catch(function(e){ alert('Fehler: ' + e); })
+                    .finally(function(){ btn.disabled = false; btn.textContent = 'Vorschläge aus Seiteninhalten laden'; });
+            };
+
+            var form = raw.closest('form');
+            if (form) form.addEventListener('submit', serialize);
+        })();
+        </script>
+        <?php
+    }
+
+    /**
      * Admin-Notice nach Purge
      */
     public function show_admin_notices() {
@@ -1219,47 +1486,7 @@ class Cloudways_Cache_Purge {
                     </tr>
                 </table>
 
-                <h2>Purge-Regeln: welche Seiten hängen an welchen Produkten?</h2>
-                <table class="form-table">
-                    <tr>
-                        <th scope="row"><label>Regeln</label></th>
-                        <td>
-                            <textarea name="<?php echo $this->option_name; ?>[purge_rules]" rows="8" class="large-text code" placeholder="marke:ecm => /espressomaschine/alle-maschinen/, /espressomaschine/ecm/, /espressomuehle/ecm/"><?php echo esc_textarea($get('purge_rules', '')); ?></textarea>
-                            <p class="description">
-                                Eine Regel pro Zeile. Ändert die JTL-Wawi ein Produkt dieser Marke/Kategorie,
-                                werden <strong>genau diese Seiten</strong> sofort gepurged und neu vorgewärmt.<br>
-                                <code>marke:ecm =&gt; /espressomaschine/alle-maschinen/, /espressomaschine/ecm/, /espressomuehle/ecm/</code><br>
-                                <code>kategorie:espressomaschinen =&gt; /espressomaschine/alle-maschinen/</code><br><br>
-                                <strong>Sicherheitsnetz:</strong> Greift für ein geändertes Produkt <em>keine</em> Regel,
-                                läuft automatisch der Sammellauf (alle Menü-URLs, max. 15 Min Verzögerung).
-                                Unvollständige Regeln sind also unkritisch — sie machen es nur präziser und billiger.
-                                Kategorien wirken inklusive Unterkategorien.
-                                <br><em>Tipp: <code>wp cw-cache suggest-rules</code> schlägt Regeln aus den Seiteninhalten vor.</em>
-                            </p>
-                            <?php
-                            $brands = get_terms(['taxonomy' => 'pwb-brand', 'hide_empty' => true, 'number' => 40, 'orderby' => 'count', 'order' => 'DESC']);
-                            $cats   = get_terms(['taxonomy' => 'product_cat', 'hide_empty' => true, 'number' => 25, 'orderby' => 'count', 'order' => 'DESC']);
-                            ?>
-                            <details style="margin-top:10px;">
-                                <summary style="cursor:pointer;font-weight:600;">Verfügbare Marken- und Kategorie-Slugs anzeigen</summary>
-                                <div style="margin-top:8px;">
-                                    <p style="margin:6px 0;"><strong>Marken</strong> (<code>marke:</code>):</p>
-                                    <p style="font-family:monospace;font-size:12px;line-height:1.9;">
-                                        <?php if (!is_wp_error($brands)) foreach ($brands as $t) {
-                                            echo '<code>' . esc_html($t->slug) . '</code> <span style="color:#888;">(' . intval($t->count) . ')</span> &nbsp; ';
-                                        } ?>
-                                    </p>
-                                    <p style="margin:12px 0 6px;"><strong>Kategorien</strong> (<code>kategorie:</code>):</p>
-                                    <p style="font-family:monospace;font-size:12px;line-height:1.9;">
-                                        <?php if (!is_wp_error($cats)) foreach ($cats as $t) {
-                                            echo '<code>' . esc_html($t->slug) . '</code> <span style="color:#888;">(' . intval($t->count) . ')</span> &nbsp; ';
-                                        } ?>
-                                    </p>
-                                </div>
-                            </details>
-                        </td>
-                    </tr>
-                </table>
+                <?php $this->render_rules_editor($get('purge_rules', '')); ?>
 
                 <h2>Automatischer Purge bei Änderungen</h2>
                 <table class="form-table">
