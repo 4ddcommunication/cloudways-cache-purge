@@ -1374,11 +1374,15 @@ class Cloudways_Cache_Purge {
 
                 type.onchange = function(){ syncType(); serialize(); };
                 slug.onchange = serialize;
-                // Initialzustand: Slug-Dropdown fuellen bzw. bei „sale" ausblenden
+
+                // Initialzustand. Das fillSlugs() hier ist zwingend: syncType()
+                // laeuft nur bei onchange, ohne diesen Aufruf blieben die
+                // Dropdowns beim Laden leer.
                 if (rule.type === 'sale') {
                     slug.style.display = 'none';
                 } else {
                     saleHint.style.display = 'none';
+                    fillSlugs(slug, rule.type, rule.slug);
                 }
 
                 tr.appendChild(td1); tr.appendChild(td2); tr.appendChild(td3); tr.appendChild(td4);
