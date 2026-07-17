@@ -43,6 +43,16 @@ class Cloudways_Cache_Purge {
     /** Gesammelte Post-IDs; wird einmal pro Request auf `shutdown` abgearbeitet. */
     private $purge_queue = [];
 
+    /**
+     * Produkte, bei denen sich der Streichpreis geaendert hat.
+     *
+     * Noetig, weil das ENTFERNEN eines Sale-Preises das Produkt von /sale/
+     * verschwinden laesst — dann hat es kein _sale_price mehr, die Sale-Seiten
+     * muessen aber trotzdem gepurged werden. Ohne dieses Merken wuerde ein
+     * beendeter Sale bis zum Nacht-Refresh weiter beworben.
+     */
+    private $sale_touched = [];
+
     public function __construct() {
         add_action('admin_bar_menu', [$this, 'add_purge_button'], 999);
         add_action('admin_menu', [$this, 'add_settings_page']);
@@ -95,6 +105,9 @@ class Cloudways_Cache_Purge {
         $type = get_post_type($object_id);
         if ($type === 'product') {
             $this->purge_queue[(int) $object_id] = true;
+            if ($meta_key === '_sale_price') {
+                $this->sale_touched[(int) $object_id] = true;
+            }
         } elseif ($type === 'product_variation') {
             // Varianten haben keine eigene URL — das Elternprodukt purgen.
             $parent = wp_get_post_parent_id($object_id);
@@ -274,11 +287,16 @@ class Cloudways_Cache_Purge {
             }
             list($trigger, $targets) = array_map('trim', explode('=>', $line, 2));
 
-            if (!preg_match('/^(marke|brand|kategorie|kategorie|cat|category)\s*:\s*(.+)$/i', $trigger, $m)) {
+            // „sale" hat keinen Slug — der Ausloeser ist der Streichpreis selbst.
+            if (preg_match('/^(sale|streichpreis|angebot)$/i', $trigger)) {
+                $type = 'sale';
+                $slug = '*';
+            } elseif (preg_match('/^(marke|brand|kategorie|cat|category)\s*:\s*(.+)$/i', $trigger, $m)) {
+                $type = in_array(strtolower($m[1]), ['marke', 'brand'], true) ? 'brand' : 'cat';
+                $slug = sanitize_title(trim($m[2]));
+            } else {
                 continue;
             }
-            $type = in_array(strtolower($m[1]), ['marke', 'brand'], true) ? 'brand' : 'cat';
-            $slug = sanitize_title(trim($m[2]));
 
             $urls = [];
             foreach (explode(',', $targets) as $u) {
@@ -331,10 +349,23 @@ class Cloudways_Cache_Purge {
             }
         }
 
+        // Sale-Auslöser: greift, wenn das Produkt AKTUELL einen Streichpreis hat
+        // ODER wenn sich _sale_price gerade geaendert hat. Der zweite Fall ist der
+        // wichtige: Wird ein Sale beendet, ist _sale_price leer — die Sale-Seiten
+        // muessen aber gepurged werden, sonst bewerben sie das Produkt weiter.
+        $is_sale = (string) get_post_meta($product_id, '_sale_price', true) !== ''
+            || isset($this->sale_touched[$product_id]);
+
         $urls    = [];
         $matched = false;
         foreach ($rules as $rule) {
-            if (isset($slugs[$rule['type']][$rule['slug']])) {
+            $hit = false;
+            if ($rule['type'] === 'sale') {
+                $hit = $is_sale;
+            } elseif (isset($slugs[$rule['type']][$rule['slug']])) {
+                $hit = true;
+            }
+            if ($hit) {
                 $matched = true;
                 foreach ($rule['urls'] as $u) {
                     $urls[$u] = true;
@@ -801,7 +832,7 @@ class Cloudways_Cache_Purge {
         // Test-/Copy-Altlasten, die zwar publish sind, aber keine echten Zielseiten.
         $junk = apply_filters('cw_cache_suggest_junk', [
             '/startseite_neu/', '/startseite_neu-copy/', '/startseite_neu-copy-copy/',
-            '/maschinen-filter-test/', '/test-ajaaxo/',
+            '/maschinen-filter-test/', '/test-ajaaxo/', '/sale-filter-test/',
         ]);
 
         $by_slug = []; // slug => ['brand'|'cat' => true], url => true
@@ -822,6 +853,10 @@ class Cloudways_Cache_Purge {
             // [ep_products ...] und [ep_filtered_products ...]
             if (preg_match_all('/\[ep_(?:filtered_)?products([^\]]*)\]/', $content, $sc)) {
                 foreach ($sc[1] as $attrs) {
+                    // sale="true" -> Seite lebt vom Streichpreis, nicht von einer Kategorie
+                    if (preg_match('/\bsale\s*=\s*"(true|1)"/i', $attrs)) {
+                        $by_slug['sale'][$url] = true;
+                    }
                     if (preg_match('/\bbrand\s*=\s*"([^"]+)"/', $attrs, $b)) {
                         foreach (explode(',', $b[1]) as $name) {
                             $term = get_term_by('name', trim($name), 'pwb-brand');
@@ -1196,13 +1231,18 @@ class Cloudways_Cache_Purge {
                     line = line.trim();
                     if (!line || line.indexOf('=>') === -1) return;
                     var parts = line.split('=>');
-                    var trig  = parts[0].trim().split(':');
+                    var pages = parts.slice(1).join('=>').split(',').map(function(s){ return s.trim(); }).filter(Boolean);
+                    var head  = parts[0].trim();
+                    if (/^(sale|streichpreis|angebot)$/i.test(head)) {
+                        rules.push({type:'sale', slug:'', pages:pages});
+                        return;
+                    }
+                    var trig = head.split(':');
                     if (trig.length < 2) return;
-                    var type = /^(marke|brand)$/i.test(trig[0].trim()) ? 'brand' : 'cat';
                     rules.push({
-                        type: type,
+                        type: /^(marke|brand)$/i.test(trig[0].trim()) ? 'brand' : 'cat',
                         slug: trig.slice(1).join(':').trim(),
-                        pages: parts.slice(1).join('=>').split(',').map(function(s){ return s.trim(); }).filter(Boolean)
+                        pages: pages
                     });
                 });
                 return rules;
@@ -1214,7 +1254,10 @@ class Cloudways_Cache_Purge {
                     var type = tr.querySelector('.cw-type').value;
                     var slug = tr.querySelector('.cw-slug').value;
                     var pages = Array.prototype.map.call(tr.querySelectorAll('.cw-chip'), function(c){ return c.dataset.path; });
-                    if (slug && pages.length) {
+                    if (!pages.length) return;
+                    if (type === 'sale') {
+                        lines.push('sale => ' + pages.join(', '));
+                    } else if (slug) {
                         lines.push((type === 'brand' ? 'marke:' : 'kategorie:') + slug + ' => ' + pages.join(', '));
                     }
                 });
@@ -1260,7 +1303,7 @@ class Cloudways_Cache_Purge {
                 var td1 = document.createElement('td');
                 var type = document.createElement('select');
                 type.className = 'cw-type';
-                type.innerHTML = '<option value="brand">Marke</option><option value="cat">Kategorie</option>';
+                type.innerHTML = '<option value="cat">Kategorie</option><option value="brand">Marke</option><option value="sale">Sale / Streichpreis</option>';
                 type.value = rule.type;
                 td1.appendChild(type);
 
@@ -1268,8 +1311,17 @@ class Cloudways_Cache_Purge {
                 var slug = document.createElement('select');
                 slug.className = 'cw-slug';
                 slug.style.maxWidth = '270px';
-                fillSlugs(slug, rule.type, rule.slug);
-                td2.appendChild(slug);
+                var saleHint = document.createElement('em');
+                saleHint.textContent = 'jedes Produkt mit Streichpreis';
+                saleHint.style.color = '#666';
+                td2.appendChild(slug); td2.appendChild(saleHint);
+
+                function syncType() {
+                    var isSale = type.value === 'sale';
+                    slug.style.display = isSale ? 'none' : '';
+                    saleHint.style.display = isSale ? '' : 'none';
+                    if (!isSale) { fillSlugs(slug, type.value, ''); }
+                }
 
                 var td3 = document.createElement('td');
                 var box = document.createElement('div');
@@ -1294,8 +1346,14 @@ class Cloudways_Cache_Purge {
                 del.onclick = function(e){ e.preventDefault(); tr.remove(); serialize(); };
                 td4.appendChild(del);
 
-                type.onchange = function(){ fillSlugs(slug, type.value, ''); serialize(); };
+                type.onchange = function(){ syncType(); serialize(); };
                 slug.onchange = serialize;
+                // Initialzustand: Slug-Dropdown fuellen bzw. bei „sale" ausblenden
+                if (rule.type === 'sale') {
+                    slug.style.display = 'none';
+                } else {
+                    saleHint.style.display = 'none';
+                }
 
                 tr.appendChild(td1); tr.appendChild(td2); tr.appendChild(td3); tr.appendChild(td4);
                 tbody.appendChild(tr);
