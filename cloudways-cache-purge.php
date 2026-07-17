@@ -2,8 +2,8 @@
 /**
  * Plugin Name: Cloudways Cache Purge
  * Plugin URI: https://github.com/4ddcommunication/cloudways-cache-purge
- * Description: Leert Breeze + Cloudways Server-Cache (Varnish) per Knopfdruck und wärmt danach die wichtigsten Seiten vor.
- * Version: 1.2.0
+ * Description: Leert Breeze + Cloudways Server-Cache (Varnish) per Knopfdruck und wärmt danach die wichtigsten Seiten vor. Purged zusätzlich automatisch einzelne URLs bei Produkt-/Seiten-Änderungen (z.B. Preis/Bestand aus JTL-Wawi) und frischt nachts per WP-CLI den kompletten deutschen Bestand auf.
+ * Version: 1.3.0
  * Author: 4DD Communication GmbH
  * Author URI: https://4dd.de
  * License: GPL v2 or later
@@ -20,6 +20,29 @@ class Cloudways_Cache_Purge {
     private $api_base    = 'https://api.cloudways.com/api/v2';
     const CRON_HOOK      = 'cw_cache_purge_prewarm';
 
+    /**
+     * Meta-Keys, deren Aenderung eine Seite inhaltlich veraltet macht.
+     *
+     * WICHTIG: Der JTL-Wawi-Connector schreibt Preis und Bestand ueber
+     * update_post_meta() bzw. wc_update_product_stock() — NICHT ueber die
+     * WC-CRUD-Hooks allein. Breeze haengt nur an `transition_post_status`
+     * und bekommt davon nichts mit. Deshalb ist `updated_post_meta` hier
+     * das eigentliche Fangnetz, ohne das JTL-Aenderungen unsichtbar bleiben.
+     */
+    const WATCHED_META = [
+        '_price', '_regular_price', '_sale_price',
+        '_stock', '_stock_status', '_manage_stock', '_backorders',
+    ];
+
+    /** Post-Types, deren URLs bei Aenderung gepurged werden. */
+    const PURGE_TYPES = ['product', 'page', 'post', 'ep_faq'];
+
+    /** Weglot-Sprachpraefixe. Deutsch = kein Praefix (95,4 % des echten Traffics). */
+    const LANG_PREFIXES = ['en', 'fr', 'es', 'nl', 'it', 'pl'];
+
+    /** Gesammelte Post-IDs; wird einmal pro Request auf `shutdown` abgearbeitet. */
+    private $purge_queue = [];
+
     public function __construct() {
         add_action('admin_bar_menu', [$this, 'add_purge_button'], 999);
         add_action('admin_menu', [$this, 'add_settings_page']);
@@ -29,6 +52,179 @@ class Cloudways_Cache_Purge {
         add_action('wp_head', [$this, 'add_button_styles']);
         add_action('admin_head', [$this, 'add_button_styles']);
         add_action(self::CRON_HOOK, [$this, 'run_prewarm'], 10, 1);
+
+        // --- Auto-Purge einzelner URLs (v1.3.0) ---
+        if ($this->auto_purge_enabled()) {
+            add_action('updated_post_meta', [$this, 'maybe_queue_by_meta'], 10, 3);
+            add_action('added_post_meta', [$this, 'maybe_queue_by_meta'], 10, 3);
+            add_action('woocommerce_update_product', [$this, 'queue_product_id'], 10, 1);
+            add_action('woocommerce_product_set_stock', [$this, 'queue_product_object'], 10, 1);
+            add_action('woocommerce_variation_set_stock', [$this, 'queue_product_object'], 10, 1);
+            add_action('save_post', [$this, 'queue_saved_post'], 10, 2);
+            add_action('shutdown', [$this, 'flush_purge_queue'], 999);
+        }
+
+        if (defined('WP_CLI') && WP_CLI) {
+            \WP_CLI::add_command('cw-cache refresh', [$this, 'cli_refresh']);
+            \WP_CLI::add_command('cw-cache purge-url', [$this, 'cli_purge_url']);
+        }
+    }
+
+    private function auto_purge_enabled() {
+        $settings = get_option($this->option_name, []);
+        // Default AN: ohne Auto-Purge bleiben JTL-Preise bis zu 30 Tage alt (Varnish-TTL).
+        return !isset($settings['auto_purge_enabled']) || !empty($settings['auto_purge_enabled']);
+    }
+
+    // =====================================================================
+    // Auto-Purge (v1.3.0)
+    // =====================================================================
+
+    /**
+     * Fangnetz fuer JTL: Preis-/Bestands-Meta wird direkt geschrieben,
+     * ohne dass WC- oder Breeze-Hooks feuern.
+     */
+    public function maybe_queue_by_meta($meta_id, $object_id, $meta_key) {
+        // Billigster Check zuerst — dieser Hook feuert bei JEDEM Meta-Write.
+        if (!in_array($meta_key, self::WATCHED_META, true)) {
+            return;
+        }
+        $type = get_post_type($object_id);
+        if ($type === 'product') {
+            $this->purge_queue[(int) $object_id] = true;
+        } elseif ($type === 'product_variation') {
+            // Varianten haben keine eigene URL — das Elternprodukt purgen.
+            $parent = wp_get_post_parent_id($object_id);
+            if ($parent) {
+                $this->purge_queue[(int) $parent] = true;
+            }
+        }
+    }
+
+    public function queue_product_id($product_id) {
+        if ($product_id) {
+            $this->purge_queue[(int) $product_id] = true;
+        }
+    }
+
+    public function queue_product_object($product) {
+        if (!is_object($product) || !method_exists($product, 'get_id')) {
+            return;
+        }
+        $id = $product->get_id();
+        if (method_exists($product, 'get_parent_id') && $product->get_parent_id()) {
+            $id = $product->get_parent_id();
+        }
+        $this->purge_queue[(int) $id] = true;
+    }
+
+    /** Deckt u.a. „Banner auf eine Unterseite" ab: Seite speichern = URL frisch. */
+    public function queue_saved_post($post_id, $post) {
+        if (wp_is_post_revision($post_id) || wp_is_post_autosave($post_id)) {
+            return;
+        }
+        if (!is_object($post) || $post->post_status !== 'publish') {
+            return;
+        }
+        if (!in_array($post->post_type, self::PURGE_TYPES, true)) {
+            return;
+        }
+        $this->purge_queue[(int) $post_id] = true;
+    }
+
+    /**
+     * Einmal pro Request auf `shutdown`: dedupliziert purgen.
+     *
+     * Warum gesammelt statt sofort: Ein JTL-Bulk-Sync schreibt pro Produkt
+     * mehrere Metas (_price, _stock, _stock_status ...). Sofort-Purge wuerde
+     * dieselbe URL vielfach purgen und Varnishs Ban-Liste aufblaehen.
+     */
+    public function flush_purge_queue() {
+        if (empty($this->purge_queue)) {
+            return;
+        }
+
+        $ids = array_keys($this->purge_queue);
+        $this->purge_queue = [];
+
+        // Schutz gegen Massen-Importe: lieber ein paar URLs stehen lassen,
+        // als Varnish mit tausenden Bans zu fluten. Der Nacht-Cron holt den Rest.
+        $max = (int) apply_filters('cw_cache_max_auto_purge', 100);
+        $capped = count($ids) > $max;
+        if ($capped) {
+            $ids = array_slice($ids, 0, $max);
+        }
+
+        $urls = [];
+        foreach ($ids as $id) {
+            $link = get_permalink($id);
+            if (!$link) {
+                continue;
+            }
+            foreach ($this->url_variants($link) as $variant) {
+                $urls[$variant] = true;
+            }
+        }
+
+        $done = 0;
+        foreach (array_keys($urls) as $url) {
+            if ($this->purge_url($url)) {
+                $done++;
+            }
+        }
+
+        update_option('cw_last_auto_purge', [
+            'time'    => current_time('mysql'),
+            'posts'   => count($ids),
+            'urls'    => $done,
+            'capped'  => $capped,
+        ], false);
+    }
+
+    /** Deutsche URL + alle Weglot-Sprachvarianten. */
+    private function url_variants($url) {
+        $variants = [$url];
+        $home = home_url('/');
+        foreach (self::LANG_PREFIXES as $lang) {
+            $variants[] = str_replace($home, $home . $lang . '/', $url);
+        }
+        return $variants;
+    }
+
+    /**
+     * Purge EINER URL — beide Page-Cache-Schichten.
+     *
+     * ⚠ NIEMALS die HTTP-Methode PURGE benutzen: Cloudways' VCL macht daraus
+     * ban("req.http.host ~ ...") und loescht den Cache der GANZEN Domain
+     * (/etc/varnish/recv/default.vcl). Nur URLPURGE bannt host+url exakt
+     * (/etc/varnish/recv/woocommerce.vcl:16-24).
+     *
+     * Breeze-only reicht nicht: gemessen 17.07. liefert Varnish danach weiter
+     * HIT mit altem Inhalt aus. Erst Breeze + Varnish ergibt einen echten Render.
+     */
+    public function purge_url($url) {
+        if (empty($url)) {
+            return false;
+        }
+
+        if (function_exists('breeze_varnish_purge_cache')) {
+            // Loescht die Breeze-Datei UND schickt URLPURGE an Varnish.
+            breeze_varnish_purge_cache($url, true);
+            return true;
+        }
+
+        // Fallback, falls Breeze mal weg ist: URLPURGE direkt an Varnish.
+        $parts = wp_parse_url($url);
+        if (empty($parts['host'])) {
+            return false;
+        }
+        $response = wp_remote_request('http://127.0.0.1' . ($parts['path'] ?? '/'), [
+            'method'    => 'URLPURGE',
+            'headers'   => ['Host' => $parts['host']],
+            'timeout'   => 5,
+            'sslverify' => false,
+        ]);
+        return !is_wp_error($response);
     }
 
     /**
@@ -137,9 +333,51 @@ class Cloudways_Cache_Purge {
             }
         }
 
+        // 4. Voll-Refresh im Hintergrund anstossen (Szenario „Banner auf alle Seiten"):
+        // Nach einem Komplett-Purge ist ALLES kalt und jeder Kunde zahlt ~7 s pro
+        // erster Seite. Das Menue-Prewarming oben deckt nur die Einstiegsseiten ab.
+        if (!empty($settings['refresh_after_purge'])) {
+            $report['refresh'] = $this->spawn_background_refresh();
+        }
+
         update_option('cw_last_purge', $report);
 
         return $report;
+    }
+
+    /**
+     * Startet `wp cw-cache refresh` losgeloest im Hintergrund.
+     *
+     * Warum exec statt wp-cron: spawn_cron() funktioniert auf Cloudways nicht
+     * (DISABLE_WP_CRON + PHP-FPM killt lange Requests). flock verhindert, dass
+     * mehrfaches Klicken mehrere Laeufe parallel startet.
+     * Niedrigere Parallelitaet als nachts, weil das hier zur Tageszeit laufen kann.
+     */
+    private function spawn_background_refresh($concurrency = 4) {
+        if (!function_exists('exec')) {
+            return ['started' => false, 'note' => 'exec() nicht verfuegbar'];
+        }
+
+        $lock = WP_CONTENT_DIR . '/cache/cw-refresh.lock';
+        $log  = WP_CONTENT_DIR . '/cache/cw-refresh.log';
+        $wp   = '/usr/local/bin/wp';
+
+        if (!file_exists($wp)) {
+            return ['started' => false, 'note' => 'wp-cli nicht gefunden'];
+        }
+
+        $cmd = sprintf(
+            'nohup flock -n %s %s --path=%s cw-cache refresh --concurrency=%d >> %s 2>&1 &',
+            escapeshellarg($lock),
+            escapeshellarg($wp),
+            escapeshellarg(ABSPATH),
+            (int) $concurrency,
+            escapeshellarg($log)
+        );
+
+        exec($cmd);
+
+        return ['started' => true, 'concurrency' => $concurrency];
     }
 
     /**
@@ -338,6 +576,201 @@ class Cloudways_Cache_Purge {
         ]);
     }
 
+    // =====================================================================
+    // WP-CLI: naechtlicher Refresh (v1.3.0)
+    // =====================================================================
+
+    /**
+     * `wp cw-cache purge-url <url>` — einzelne URL purgen (Debug/manuell).
+     */
+    public function cli_purge_url($args) {
+        if (empty($args[0])) {
+            \WP_CLI::error('URL fehlt. Beispiel: wp cw-cache purge-url https://espressoperfetto.de/produkt/xy/');
+        }
+        $this->purge_url($args[0]);
+        \WP_CLI::success('Gepurged: ' . $args[0]);
+    }
+
+    /**
+     * `wp cw-cache refresh` — purged + waermt den kompletten deutschen Bestand.
+     *
+     * Bewusst als WP-CLI und nicht als wp-cron: Auf Cloudways funktioniert
+     * spawn_cron() nicht (DISABLE_WP_CRON + PHP-FPM killt lange Requests).
+     * Aufruf per Server-Crontab nachts.
+     *
+     * Pro URL wird erst gepurged, dann SOFORT neu geholt — das Kaltfenster ist
+     * damit sekundenkurz statt „ganze Nacht kalt". Ein Komplett-Purge vorab
+     * waere gefaehrlich: 30 Tage warmer Cache weg, und alles was bis morgens
+     * nicht durch ist, trifft echte Kunden mit ~7-s-Renders.
+     *
+     * ## OPTIONS
+     * [--concurrency=<n>]  : Parallele Requests (Default 8).
+     * [--limit=<n>]        : Nur die ersten n URLs (Test).
+     * [--types=<liste>]    : Post-Types, Default "page,product".
+     * [--dry-run]          : Nur zeigen, was passieren wuerde.
+     */
+    public function cli_refresh($args, $assoc = []) {
+        $concurrency = max(1, (int) ($assoc['concurrency'] ?? 8));
+        $limit       = (int) ($assoc['limit'] ?? 0);
+        $types       = array_filter(array_map('trim', explode(',', $assoc['types'] ?? 'page,product')));
+        $dry         = isset($assoc['dry-run']);
+
+        $urls = $this->collect_refresh_urls($types);
+        if ($limit > 0) {
+            $urls = array_slice($urls, 0, $limit);
+        }
+
+        $total = count($urls);
+        if (!$total) {
+            \WP_CLI::warning('Keine URLs gefunden.');
+            return;
+        }
+
+        \WP_CLI::log(sprintf('%d URLs, Parallelitaet %d%s', $total, $concurrency, $dry ? ' (DRY RUN)' : ''));
+        if ($dry) {
+            foreach (array_slice($urls, 0, 10) as $u) {
+                \WP_CLI::log('  ' . $u);
+            }
+            \WP_CLI::success('Dry Run — nichts veraendert.');
+            return;
+        }
+
+        $started  = microtime(true);
+        $progress = \WP_CLI\Utils\make_progress_bar('Refresh', $total);
+        $ok = 0;
+
+        foreach (array_chunk($urls, $concurrency) as $chunk) {
+            foreach ($chunk as $url) {
+                $this->purge_url($url);
+            }
+            $ok += $this->fetch_parallel($chunk);
+            foreach ($chunk as $_) {
+                $progress->tick();
+            }
+        }
+        $progress->finish();
+
+        $duration = round(microtime(true) - $started, 1);
+        update_option('cw_last_refresh', [
+            'time'     => current_time('mysql'),
+            'urls'     => $total,
+            'ok'       => $ok,
+            'duration' => $duration,
+        ], false);
+
+        \WP_CLI::success(sprintf('%d/%d URLs neu gewaermt in %s s.', $ok, $total, $duration));
+    }
+
+    /** Alle veroeffentlichten URLs der angegebenen Types (deutsch) + Startseite. */
+    private function collect_refresh_urls($types) {
+        $urls = [home_url('/')];
+
+        // WooCommerce-Funktionsseiten nie waermen: Varnish pipet sie ohnehin
+        // durch (recv/woocommerce.vcl), sie sind personalisiert, und ein
+        // Prewarm-Request wuerde nur eine sinnlose Session erzeugen.
+        // Ueber Page-IDs statt Slugs — funktioniert sprachunabhaengig.
+        $skip_ids = [];
+        if (function_exists('wc_get_page_id')) {
+            foreach (['cart', 'checkout', 'myaccount'] as $wc_page) {
+                $id = wc_get_page_id($wc_page);
+                if ($id > 0) {
+                    $skip_ids[$id] = true;
+                }
+            }
+        }
+
+        // Zusaetzlich die Exclude-Liste aus den Einstellungen (Substring-Match).
+        // Faengt Altlasten, die WC nicht mehr kennt — z.B. die verwaiste Seite
+        // /kasse/ (ID 85129), die nicht die echte Checkout-Seite ist
+        // (das ist /kasse-checkout/, ID 85153).
+        $settings = get_option($this->option_name, []);
+        $exclude  = $this->parse_url_lines($settings['refresh_exclude'] ?? "/kasse/\n/danke/\n/bestellbestaetigung/");
+
+        $ids = get_posts([
+            'post_type'              => $types,
+            'post_status'            => 'publish',
+            'posts_per_page'         => -1,
+            'fields'                 => 'ids',
+            'orderby'                => 'ID',
+            'order'                  => 'ASC',
+            'no_found_rows'          => true,
+            'update_post_meta_cache' => false,
+            'update_post_term_cache' => false,
+        ]);
+
+        foreach ($ids as $id) {
+            if (isset($skip_ids[$id])) {
+                continue;
+            }
+            $link = get_permalink($id);
+            if (!$link) {
+                continue;
+            }
+            foreach ($exclude as $pattern) {
+                if ($pattern !== '' && strpos($link, $pattern) !== false) {
+                    continue 2;
+                }
+            }
+            $urls[$link] = $link;
+        }
+
+        return array_values(array_unique(array_values($urls)));
+    }
+
+    /**
+     * Parallel holen via curl_multi.
+     *
+     * Bewusst BLOCKIEREND (anders als run_prewarm mit blocking=false): Nur so
+     * wissen wir, ob die Seite wirklich gerendert und gecacht wurde.
+     */
+    private function fetch_parallel($urls) {
+        if (!function_exists('curl_multi_init')) {
+            foreach ($urls as $url) {
+                wp_remote_get($url, ['timeout' => 30, 'sslverify' => false]);
+            }
+            return count($urls);
+        }
+
+        $mh      = curl_multi_init();
+        $handles = [];
+
+        foreach ($urls as $url) {
+            $ch = curl_init();
+            curl_setopt_array($ch, [
+                CURLOPT_URL            => $url,
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_NOBODY         => false,
+                CURLOPT_TIMEOUT        => 60,
+                CURLOPT_SSL_VERIFYPEER => false,
+                CURLOPT_SSL_VERIFYHOST => 0,
+                CURLOPT_FOLLOWLOCATION => true,
+                CURLOPT_USERAGENT      => 'CW-Cache-Prewarmer/1.3',
+                CURLOPT_HTTPHEADER     => ['X-CW-Prewarm: 1'],
+            ]);
+            curl_multi_add_handle($mh, $ch);
+            $handles[] = $ch;
+        }
+
+        do {
+            $status = curl_multi_exec($mh, $running);
+            if ($running) {
+                curl_multi_select($mh, 1.0);
+            }
+        } while ($running && $status === CURLM_OK);
+
+        $ok = 0;
+        foreach ($handles as $ch) {
+            if (curl_getinfo($ch, CURLINFO_HTTP_CODE) === 200) {
+                $ok++;
+            }
+            curl_multi_remove_handle($mh, $ch);
+            curl_close($ch);
+        }
+        curl_multi_close($mh);
+
+        return $ok;
+    }
+
     /**
      * Admin-Notice nach Purge
      */
@@ -409,6 +842,10 @@ class Cloudways_Cache_Purge {
             'prewarm_extra_urls'    => sanitize_textarea_field($input['prewarm_extra_urls'] ?? ''),
             'prewarm_exclude'       => sanitize_textarea_field($input['prewarm_exclude'] ?? "/shop/\n#"),
             'prewarm_batch_size'    => max(1, min(20, intval($input['prewarm_batch_size'] ?? 5))),
+            // v1.3.0
+            'auto_purge_enabled'    => !empty($input['auto_purge_enabled']) ? 1 : 0,
+            'refresh_after_purge'   => !empty($input['refresh_after_purge']) ? 1 : 0,
+            'refresh_exclude'       => sanitize_textarea_field($input['refresh_exclude'] ?? "/kasse/\n/danke/\n/bestellbestaetigung/"),
         ];
     }
 
@@ -475,6 +912,53 @@ class Cloudways_Cache_Purge {
                                 }
                                 ?>
                             </select>
+                        </td>
+                    </tr>
+                </table>
+
+                <h2>Automatischer Purge bei Änderungen</h2>
+                <table class="form-table">
+                    <tr>
+                        <th scope="row"><label>Auto-Purge aktiviert</label></th>
+                        <td>
+                            <label>
+                                <input type="checkbox" name="<?php echo $this->option_name; ?>[auto_purge_enabled]" value="1" <?php checked(!empty($get('auto_purge_enabled', 1))); ?>>
+                                Bei Produkt- und Seiten-Änderungen automatisch nur die betroffene URL purgen
+                            </label>
+                            <p class="description">
+                                Fängt auch Preis- und Bestands-Updates aus der <strong>JTL-Wawi</strong> ab (die schreiben
+                                direkt per <code>update_post_meta</code> und lösen sonst keinerlei Purge aus).
+                                Gepurged werden Breeze <em>und</em> Varnish per <code>URLPURGE</code> — jeweils nur die eine
+                                URL plus ihre Sprachvarianten, nicht der ganze Shop.
+                                <br><strong>Ohne diese Option bleiben JTL-Preise bis zu 30 Tage alt</strong> (Varnish-TTL).
+                            </p>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th scope="row"><label>Voll-Refresh nach manuellem Purge</label></th>
+                        <td>
+                            <label>
+                                <input type="checkbox" name="<?php echo $this->option_name; ?>[refresh_after_purge]" value="1" <?php checked(!empty($get('refresh_after_purge', 0))); ?>>
+                                Nach dem großen Purge-Button alle Seiten im Hintergrund neu vorwärmen
+                            </label>
+                            <p class="description">
+                                Für Fälle wie „Banner auf allen Seiten“: Nach einem Komplett-Purge ist der ganze Shop kalt
+                                und jeder Kunde zahlt ~7 s pro erster Seite. Diese Option startet im Hintergrund
+                                <code>wp cw-cache refresh</code> (~1.670 URLs, dauert ~1–2 h bei geringer Parallelität).
+                                <br><strong>Achtung:</strong> erzeugt Last. Bei kleinen Änderungen unnötig — dort reicht das
+                                Speichern der Seite selbst, das purged die URL bereits automatisch.
+                            </p>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th scope="row"><label>Vom Refresh ausschließen</label></th>
+                        <td>
+                            <textarea name="<?php echo $this->option_name; ?>[refresh_exclude]" rows="3" class="large-text code"><?php echo esc_textarea($get('refresh_exclude', "/kasse/\n/danke/\n/bestellbestaetigung/")); ?></textarea>
+                            <p class="description">
+                                Ein Muster pro Zeile (Teilstring-Match). Warenkorb, Kasse und Mein-Konto werden bereits
+                                automatisch über die WooCommerce-Seiten-IDs ausgeschlossen — hier nur Altlasten eintragen,
+                                die WooCommerce nicht mehr kennt (z.B. die verwaiste Seite <code>/kasse/</code>).
+                            </p>
                         </td>
                     </tr>
                 </table>
