@@ -3,7 +3,7 @@
  * Plugin Name: Cloudways Cache Purge
  * Plugin URI: https://github.com/4ddcommunication/cloudways-cache-purge
  * Description: Leert Breeze + Cloudways Server-Cache (Varnish) per Knopfdruck und wärmt danach die wichtigsten Seiten vor. Purged zusätzlich automatisch einzelne URLs bei Produkt-/Seiten-Änderungen (z.B. Preis/Bestand aus JTL-Wawi) und frischt nachts per WP-CLI den kompletten deutschen Bestand auf.
- * Version: 1.3.2
+ * Version: 1.4.0
  * Author: 4DD Communication GmbH
  * Author URI: https://4dd.de
  * License: GPL v2 or later
@@ -87,6 +87,7 @@ class Cloudways_Cache_Purge {
         if (defined('WP_CLI') && WP_CLI) {
             \WP_CLI::add_command('cw-cache refresh', [$this, 'cli_refresh']);
             \WP_CLI::add_command('cw-cache refresh-listings', [$this, 'cli_refresh_listings']);
+            \WP_CLI::add_command('cw-cache refresh-products', [$this, 'cli_refresh_products']);
             \WP_CLI::add_command('cw-cache suggest-rules', [$this, 'cli_suggest_rules']);
             \WP_CLI::add_command('cw-cache wdr-check', [$this, 'cli_wdr_check']);
             \WP_CLI::add_command('cw-cache purge-url', [$this, 'cli_purge_url']);
@@ -312,12 +313,57 @@ class Cloudways_Cache_Purge {
             }
         }
 
+        // Gepurgte Produktseiten zum Wiederwaermen vormerken (Cron alle 5 Min:
+        // `wp cw-cache refresh-products`). Gemessen 27.10.2026: 5.683 ungecachte
+        // Produkt-Render bei 9.910 Produktaufrufen am Tag, 2,7-6,7 s pro Aufruf —
+        // ein gepurgtes Produkt blieb bis zum Nacht-Refresh kalt. Nicht inline
+        // waermen: das liefe im JTL-Connector-Request, bei 45-131 Produkten pro
+        // Werktag zu lange (siehe oben). Nur die deutsche URL (95 % des Traffics).
+        $this->mark_products_dirty($ids);
+
         update_option('cw_last_auto_purge', [
             'time'    => current_time('mysql'),
             'posts'   => count($ids),
             'urls'    => $done,
             'capped'  => $capped,
         ], false);
+    }
+
+    /**
+     * Deutsche Permalinks veroeffentlichter Produkte in `cw_products_dirty`
+     * sammeln (URL => Zeitstempel). Gedeckelt, damit ein Massen-Import die
+     * Option nicht aufblaeht — die aeltesten fliegen raus, den Rest holt der
+     * Nacht-Refresh.
+     */
+    private function mark_products_dirty(array $ids) {
+        $links = [];
+        foreach ($ids as $id) {
+            if (get_post_type($id) !== 'product' || get_post_status($id) !== 'publish') {
+                continue;
+            }
+            $link = get_permalink($id);
+            if ($link) {
+                $links[$link] = true;
+            }
+        }
+        if (!$links) {
+            return;
+        }
+
+        $dirty = get_option('cw_products_dirty', []);
+        if (!is_array($dirty)) {
+            $dirty = [];
+        }
+        foreach (array_keys($links) as $link) {
+            $dirty[$link] = time();
+        }
+
+        $max = (int) apply_filters('cw_cache_max_dirty_products', 300);
+        if (count($dirty) > $max) {
+            asort($dirty);
+            $dirty = array_slice($dirty, -$max, null, true);
+        }
+        update_option('cw_products_dirty', $dirty, false);
     }
 
     /**
@@ -1053,6 +1099,49 @@ class Cloudways_Cache_Purge {
         ], false);
 
         \WP_CLI::success(sprintf('%d/%d Uebersichtsseiten aufgefrischt in %s s.', $ok, count($urls), $duration));
+    }
+
+    /**
+     * `wp cw-cache refresh-products` — waermt Produktseiten wieder an, die der
+     * Auto-Purge seit dem letzten Lauf geleert hat (Option cw_products_dirty).
+     *
+     * Bewusst OHNE erneuten Purge: Hat ein Besucher die Seite inzwischen selbst
+     * gerendert, ist sie warm, und unser Abruf ist nur ein billiger HIT. Laeuft
+     * als Cron alle 5 Minuten; vorher blieb ein gepurgtes Produkt bis zum
+     * Nacht-Refresh kalt (gemessen 27.10.2026: jeder dritte Produktaufruf ungecacht).
+     *
+     * ## OPTIONS
+     * [--concurrency=<n>]  : Parallele Requests (Default 4).
+     */
+    public function cli_refresh_products($args, $assoc = []) {
+        $dirty = get_option('cw_products_dirty', []);
+        if (!is_array($dirty) || !$dirty) {
+            \WP_CLI::log('Keine gepurgten Produkte — nichts zu tun.');
+            return;
+        }
+
+        // Option VOR der Arbeit loeschen: Purges waehrend des Laufs sollen den
+        // naechsten Lauf ausloesen, nicht verschluckt werden.
+        delete_option('cw_products_dirty');
+
+        $concurrency = max(1, (int) ($assoc['concurrency'] ?? 4));
+        $urls = array_keys($dirty);
+
+        $started = microtime(true);
+        $ok = 0;
+        foreach (array_chunk($urls, $concurrency) as $chunk) {
+            $ok += $this->fetch_parallel($chunk);
+        }
+
+        $duration = round(microtime(true) - $started, 1);
+        update_option('cw_last_products_refresh', [
+            'time'     => current_time('mysql'),
+            'urls'     => count($urls),
+            'ok'       => $ok,
+            'duration' => $duration,
+        ], false);
+
+        \WP_CLI::success(sprintf('%d/%d Produktseiten wieder angewaermt in %s s.', $ok, count($urls), $duration));
     }
 
     /**

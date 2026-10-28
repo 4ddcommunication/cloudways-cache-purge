@@ -51,6 +51,12 @@ curl -X GET "https://api.cloudways.com/api/v2/server" \
 
 ## Changelog
 
+### 1.4.0 (2026-10-28) — Produktseiten nach Purge wieder anwärmen
+- Auto-Purge merkt gepurgte Produkte in `cw_products_dirty` vor (deutsche URL, nur `publish`, Deckel 300 per Filter `cw_cache_max_dirty_products`).
+- Neuer Befehl `wp cw-cache refresh-products [--concurrency=<n>]` (Cron alle 5 Minuten) wärmt sie wieder an, ohne erneut zu purgen. Anlass: Log 27.10.2026, 5.683 ungecachte Produkt-Render bei 9.910 Produktaufrufen am Tag (2,7–6,7 s), weil gepurgte Produkte bis zum Nacht-Refresh kalt blieben.
+- ⚠ `wp eval "do_action('woocommerce_update_product', ID)"` als Test löst in der CLI einen Fatal in WooCommerces OnboardingTasks aus (fremder Listener). Zum Testen `queue_product_id(ID)` auf einer Instanz aufrufen, der `shutdown`-Hook flusht.
+
+
 - **1.2.0** — Breeze-Mit-Purge + Pre-Warmer mit Menü-Quelle und Exclude-Patterns
 - **1.1.0** — Admin-Bar-Button + Settings-Seite (nur Cloudways API)
 - **1.0.0** — Initial release
